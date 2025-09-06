@@ -1,0 +1,2117 @@
+---
+title: "PLASMA Proteomics Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+# =============================================================================
+# SETUP AND PACKAGE LOADING
+# =============================================================================
+
+# Clear global environment
+rm(list = ls())
+
+# Start timer for performance tracking
+start.time <- proc.time()
+
+# Define required packages
+packages_to_load <- c(
+  # Core data manipulation
+  "plyr", "dplyr", "tidyr", "reshape2", 
+  # Bioinformatics
+  "Seurat", "GSVA", "preprocessCore", "AnnotationDbi", 
+  "org.Mm.eg.db", "org.Hs.eg.db", "homologene", "topGO",
+  # Visualization
+  "ggplot2", "gridExtra", "ggpmisc", "ggExtra", "ggrepel", 
+  "RColorBrewer", "plotly", "DT", "flexdashboard",
+  # Statistics and modeling
+  "survival", "survminer", "ddpcr", "quantreg",
+  # Utilities
+  "stringr", "tm", "future", "parallel", "doParallel", "foreach",
+  # Custom package
+  "scMiko"
+)
+
+# Load packages silently
+invisible(lapply(packages_to_load, library, character.only = TRUE, quietly = TRUE))
+
+```
+
+```{r global_variables}
+# =============================================================================
+# GLOBAL VARIABLES AND CONSTANTS
+# =============================================================================
+
+# Define biomarker panel once (avoid repetition throughout code)
+BIOMARKER_LIST <- c(
+  "FABP4", "GFAP", "IFNgamma", "IL10", "IL12p70", "IL13", 
+  "IL1beta", "IL2", "IL4", "IL6", "IL8", "MMP1", 
+  "MMP3", "MMP9", "NEFL", "Tau", "TNFalpha"
+)
+
+BASE_DIR <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Collaborations/Alireza/PLASMA_GBM/"
+DATA_FILE <- "Sheets_all_collab_data_glioma.xlsx"
+```
+
+```{r data_import}
+# =============================================================================
+# DATA IMPORT
+# =============================================================================
+
+# Read data from Excel sheets
+
+import_data <- function(dir_path, file_name) {
+  file_path <- file.path(dir_path, file_name)
+  
+  if (!file.exists(file_path)) {
+    stop(paste("File not found:", file_path))
+  }
+  
+  # Import each sheet
+  sheets <- list(
+    andrew = readxl::read_xlsx(file_path, sheet = "Andrew_data_v2"),
+    alireza = readxl::read_xlsx(file_path, sheet = "Alireza_data"),
+    ati_cs = readxl::read_xlsx(file_path, sheet = "Ati_data_cross_sectional"),
+    ati_healthy = readxl::read_xlsx(file_path, sheet = "Ati_healthy"),
+    ati_long = readxl::read_xlsx(file_path, sheet = "Ati_data_longitudinal")
+  )
+  
+  return(sheets)
+}
+
+# Import all data
+data_sheets <- import_data(BASE_DIR, DATA_FILE)
+df.andrew <- data_sheets$andrew
+df.alireza <- data_sheets$alireza
+df.ati.healthy <- data_sheets$ati_healthy
+df.ati.cs <- data_sheets$ati_cs
+df.ati.long <- data_sheets$ati_long
+```
+
+```{r data_cleaning_functions}
+# =============================================================================
+# DATA CLEANING FUNCTIONS
+# =============================================================================
+
+#' Clean Ati cohort data
+#' @param df_ati Raw Ati data frame
+#' @return Cleaned data frame with standardized columns
+clean_ati_data <- function(df_ati) {
+  # Select relevant columns
+  df_clean <- df_ati %>% 
+    dplyr::select(
+      MSD_ID = NSTB_ID,
+      subject_ID = Sample,
+      diagnosis = Final_Diagnosis_based_on_WHO_2021,
+      recurrence_status = New_diagnosis_vs_recurrent_diagnosis,
+      IDH1_mut = IDH1_Status,
+      MGMT_meth = MGMT_Promotor_Methylation,
+      EGFR_mut = EGFR_Status,
+      ATRX_loss = ATRX_Expression,
+      sex = Sex,
+      age = Age_at_time_of_collection,
+      Last_known_survival_days,
+      Overall_survival_days,
+      status = Survival_Status,
+      # Biomarkers
+      FABP4, GFAP, 
+      IFNgamma = IFN_gamma,
+      IL10 = IL_10, IL12p70 = IL_12p70, IL13 = IL_13,
+      IL1beta = IL_1beta, IL2 = IL_2, IL4 = IL_4, 
+      IL6 = IL_6, IL8 = IL_8,
+      MMP1 = MMP_1, MMP3, MMP9 = MMP_9,
+      NEFL, Tau, TNFalpha = TNF_alpha
+    )
+  
+  # Standardize recurrence status
+  df_clean$recurrence_status[df_clean$recurrence_status == "New"] <- "Primary"
+  
+  # Calculate survival time
+  df_clean$time <- coalesce(df_clean$Last_known_survival_days, 
+                            df_clean$Overall_survival_days)
+  
+  # Clean survival status
+  which_na <- df_clean$status %in% c("lost to follow up", "unknown")
+  df_clean$status <- df_clean$status == "deceased"
+  df_clean$status[which_na] <- NA
+  
+  # Standardize mutation status
+  df_clean <- df_clean %>%
+    dplyr::mutate(
+      IDH1_mut = case_when(
+        IDH1_mut == "Wild Type" ~ "WT",
+        IDH1_mut == "Mutated" ~ "mutant",
+        IDH1_mut == "Not reported" ~ NA_character_,
+        TRUE ~ IDH1_mut
+      ),
+      MGMT_meth = na_if(MGMT_meth, "Not reported"),
+      EGFR_mut = case_when(
+        EGFR_mut == "Wild-type" ~ "WT",
+        EGFR_mut %in% c("EGFR VIII", "Mutated") ~ "mutant",
+        EGFR_mut == "Not reported" ~ NA_character_,
+        TRUE ~ EGFR_mut
+      ),
+      ATRX_loss = na_if(ATRX_loss, "Not reported"),
+      cohort = "Ati",
+      subject_ID = as.character(subject_ID)
+    )
+  
+  # Select final columns
+  df_clean %>%
+    dplyr::select(-Last_known_survival_days, -Overall_survival_days)
+}
+
+#' Clean Alireza cohort data
+#' Similar structure to clean_ati_data
+clean_alireza_data <- function(df_alireza) {
+  
+    # Replace "n/a" with NA
+  
+  for(col in names(df_alireza)) {
+  if(is.character(df_alireza[[col]]) || is.factor(df_alireza[[col]])) {
+    df_alireza[[col]][df_alireza[[col]] == "n/a"] <- NA
+  }
+}
+  
+  df_clean <- df_alireza %>%
+    rename_with(~gsub(" ", "_", .x)) %>%
+    rename_with(~gsub("-", "", .x)) %>%
+    mutate(
+      age = as.numeric(Sample_collection_date - Birthdate) / 365,
+      time = as.numeric(Last_known_date - Diagnosis_date),
+      status = Alive == "No",
+      tumor_volume = as.numeric(na_if(Tumor_volume, "unmeasurable disease")),
+      IDH1_mut = "WT",  # All WT in this cohort
+      EGFR_mut = case_when(
+        EGFR_mut == "Positive" ~ "mutant",
+        EGFR_mut == "Negative" ~ "WT",
+        TRUE ~ NA_character_
+      ),
+      ATRX_loss = case_when(
+        ATRX_loss == "Positive" ~ "Lost",
+        ATRX_loss == "Negative" ~ "Retained",
+        TRUE ~ NA_character_
+      ),
+      cohort = "Alireza",
+      subject_ID = as.character(Subject_ID)
+    )
+  
+
+  
+  # Rename and select columns
+  df_clean %>%
+    dplyr::select(
+      MSD_ID = MSD_ID, subject_ID, pair = Pair, 
+      diagnosis = Diagnosis, recurrence_status = Type,
+      IDH1_mut, MGMT_meth = MGMT_met, EGFR_mut, ATRX_loss,
+      sex = Sex, age, time, status, tumor_volume,
+      FABP4, MMP1, MMP3, MMP9, GFAP, NEFL = NfL, Tau = tTau,
+      cohort
+    )
+}
+
+#' Clean Andrew cohort data
+clean_andrew_data <- function(df_andrew, df_mapping, df_raw) {
+  # Create ID mapping
+  id_map <- setNames(df_mapping$`MSD ID`, df_mapping$`Sample ID`)
+  
+  # Merge with raw data
+  df_andrew$Sample <- gsub(" ", "", id_map[as.character(df_andrew$ID)])
+  df_raw$Sample <- gsub(" ", "", df_raw$Sample)
+  df_merged <- merge(df_andrew, df_raw, by = "Sample")
+
+  
+  # Clean and standardize
+  df_clean <- df_merged %>%
+    mutate(
+      age = as.numeric(Path_Date_1 - Birthdate) / 365,
+      time_calc = (coalesce(Date_of_death, Last_known_date_in_hospital)),
+      time = as.numeric(time_calc - (Path_Date_1)),
+      status_clean = Status == "Dead",
+      status_clean = ifelse(is.na(Status), NA, status_clean),
+      recurrence_status = case_when(
+        `Primary or Recurrent` %in% c("Quaternary", "Recurrent", "Tertiary") ~ "Recurrent",
+        `Primary or Recurrent` == "Primary" ~ "Primary",
+        TRUE ~ NA_character_
+      ),
+      IDH1_mut = case_when(
+        IDH1 %in% c("CTL", "WT") ~ "WT",
+        IDH1 == "MUT" ~ "mutant",
+        TRUE ~ NA_character_
+      ),
+      sex = case_when(
+        SEX == "F" ~ "Female",
+        SEX == "M" ~ "Male",
+        TRUE ~ NA_character_
+      ),
+      tumor_volume = as.numeric(Tumor_volume),
+      MGMT_meth = case_when(
+        MGMT == "Met" ~ "Positive",
+        MGMT == "Unmet" ~ "Negative",
+        TRUE ~ NA_character_
+      ),
+      ATRX_loss = case_when(
+        ATRX == "Ret" ~ "Retained",
+        ATRX == "Loss" ~ "Lost",
+        TRUE ~ NA_character_
+      ),
+      cohort = "Andrew",
+      subject_ID = as.character(ID)
+    )
+  
+  
+  # Select and rename final columns
+  df_clean %>%
+    dplyr::select(
+      MSD_ID = Sample, subject_ID, pair = Pair,
+      recurrence_status, diagnosis = Diagnosis,
+      IDH1_mut, grade = Grade, sex, tumor_volume,
+      MGMT_meth, ATRX_loss, age, time, status = status_clean,
+      FABP4 = `FABP-4`, MMP1 = `MMP-1`, MMP3 = `MMP-3`,
+      MMP9 = `MMP-9`, GFAP, NEFL = `Nf-L`, Tau = tTau,
+      cohort
+    )
+}
+
+
+
+#' Clean Ati healthy cohort data
+#' @param df_ati Raw Ati data frame
+#' @return Cleaned data frame with standardized columns
+clean_ati_non_glioma_data <- function(df_ati) {
+  
+  
+  # df_ati <- df.ati.healthy
+  # Select relevant columns
+  df_clean <- df_ati %>% 
+    dplyr::select(
+      MSD_ID = ID,
+      subject_ID = Sample,
+      diagnosis = Final_Diagnosis_based_on_WHO_2021,
+      # recurrence_status = NA,
+      # IDH1_mut = NA,
+      # MGMT_meth = NA,
+      # EGFR_mut = NA,
+      # ATRX_loss = NA,
+      sex = Sex,
+      age = Age_at_time_of_collection,
+      Last_known_survival_days,
+      Overall_survival_days,
+      status = Survival_Status,
+      # Biomarkers
+      FABP4, GFAP, 
+      IFNgamma = IFN_gamma,
+      IL10 = IL_10, IL12p70 = IL_12p70, IL13 = IL_13,
+      IL1beta = IL_1beta, IL2 = IL_2, IL4 = IL_4, 
+      IL6 = IL_6, IL8 = IL_8,
+      MMP1 = MMP_1, MMP3, MMP9 = MMP_9,
+      NEFL, Tau, TNFalpha = TNF_alpha
+    )
+  
+  # Calculate survival time
+  df_clean$time <- coalesce(df_clean$Last_known_survival_days, 
+                            df_clean$Overall_survival_days)
+  
+  # Clean survival status
+  which_na <- df_clean$status %in% c("lost to follow up", "unknown")
+  df_clean$status <- df_clean$status == "deceased"
+  df_clean$status[which_na] <- NA
+  
+  # Standardize mutation status
+  df_clean <- df_clean %>%
+    mutate(
+      cohort = "Ati_non_glioma",
+      subject_ID = as.character(subject_ID)
+    )
+  
+  # Select final columns
+  df_clean %>%
+    dplyr::select(-Last_known_survival_days, -Overall_survival_days)
+}
+
+
+```
+
+```{r clean_data}
+# =============================================================================
+# DATA CLEANING EXECUTION
+# =============================================================================
+
+# Clean Ati data
+df.ati.clean <- clean_ati_data(df.ati.cs)
+
+# filter out redundant Ati cases
+ati.duplicate.case <- intersect(df.ati.cs$Sample, df.ati.healthy$Sample)
+
+# Clean Ati Non-glioma cohort
+df.ati.ng.clean <- clean_ati_non_glioma_data(df.ati.healthy %>% dplyr::filter(!(Sample %in% ati.duplicate.case)))
+
+# Clean Alireza data  
+df.alireza.clean <- clean_alireza_data(df.alireza)
+
+# Clean Andrew data
+df.mapping <- readxl::read_xlsx(paste0(BASE_DIR, DATA_FILE), sheet = "sample_mapping")
+df.raw <- readxl::read_xlsx(paste0(BASE_DIR, DATA_FILE), sheet = "raw_data")
+
+df.andrew.clean <- clean_andrew_data(df.andrew, df.mapping, df.raw)
+
+# Combine all cohorts
+df.dat <- bind_rows(df.ati.clean, df.alireza.clean, df.andrew.clean, df.ati.ng.clean)
+
+```
+
+```{r tumor_burden_analysis, fig.width=5, fig.height=4}
+# =============================================================================
+# TUMOR BURDEN ASSOCIATIONS
+# =============================================================================
+
+#' Analyze tumor burden associations with biomarkers
+#' @param data Combined dataset
+#' @param biomarkers Vector of biomarker names
+analyze_tumor_burden <- function(data, biomarkers) {
+  plots <- list()
+  
+  for (biomarker in biomarkers) {
+    # Prepare data
+    df_plot <- data %>%
+      dplyr::filter(diagnosis %in% "GBM") %>%
+      mutate(
+        expr = .data[[biomarker]],
+        expr_log = log10(expr + 1)
+      ) %>%
+      dplyr::select(tumor_volume, cohort, expr) %>%
+      drop_na()
+    
+    if (nrow(df_plot) == 0) next
+    
+    # Create plot
+    p <- ggplot(df_plot, aes(x = tumor_volume, y = expr)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(aes(color = cohort), method = "lm", se = TRUE) +
+      scale_x_log10() +
+      scale_y_log10() +
+      labs(
+        title = biomarker,
+        x = "Tumor Volume (log scale)",
+        y = "Expression (log scale)"
+      ) +
+      theme_miko(legend = TRUE)
+    
+    plots[[biomarker]] <- p
+    print(p)
+  }
+  
+  return(plots)
+}
+
+# Run tumor burden analysis
+tumor_burden_plots <- analyze_tumor_burden(df.dat, BIOMARKER_LIST)
+```
+
+
+```{r tumor volume assessmnet }
+
+library(tidyverse)
+library(caret)
+library(corrplot)
+library(glmnet)
+library(randomForest)
+library(broom)
+library(ModelMetrics)
+# Add correlation analysis
+
+select.biomarker <-c("FABP4", "GFAP", "MMP1",  "MMP3", "MMP9", "NEFL", "Tau")
+
+df.tumor_vol <- df.dat %>%
+  dplyr::select(tumor_volume, diagnosis, cohort,select.biomarker)
+df.tumor_vol <- df.tumor_vol[complete.cases(df.tumor_vol$tumor_volume), ]
+df.tumor_vol <- df.tumor_vol %>%
+  dplyr::filter(diagnosis %in% "GBM")
+
+
+# log-transform
+df.tumor_vol <- df.tumor_vol %>%
+  dplyr::mutate(log_tumor_volume = log10(tumor_volume + 1))
+df.tumor_vol[ ,select.biomarker] <-  log10(df.tumor_vol[ ,select.biomarker] + 1)
+
+# =============================================================================
+# BATCH CORRECTION FOR MULTI-COHORT DATA
+# =============================================================================
+
+# Apply batch correction if multiple cohorts
+biomarkers_to_use <- select.biomarker
+
+# if(length(unique(df_complete$cohort)) > 1) {
+  
+  # print("Multiple cohorts detected. Applying batch correction...")
+  
+  # Prepare biomarker matrix
+  biomarker_matrix <- df.tumor_vol %>%
+    dplyr::select(all_of(select.biomarker)) %>%
+    as.matrix() %>%
+    t()
+  
+  batch_vector <- as.factor(df.tumor_vol$cohort)
+  
+  # Apply ComBat batch correction
+  tryCatch({
+    print("Applying ComBat batch correction...")
+    
+    # Create covariate matrix (preserve diagnosis information)
+    # mod_matrix <- model.matrix(~ diagnosis_v2, data = df_complete)
+    
+    corrected_matrix <- ComBat(dat = biomarker_matrix, 
+                              batch = batch_vector,
+                              # mod = mod_matrix,
+                              par.prior = TRUE,
+                              prior.plots = FALSE)
+    
+    # Add corrected biomarkers to dataset
+    corrected_biomarkers <- as.data.frame(t(corrected_matrix))
+    colnames(corrected_biomarkers) <- paste0(biomarkers_to_use, "_corrected")
+    
+    df.tumor_vol <- df.tumor_vol %>%
+      bind_cols(corrected_biomarkers)
+    
+    biomarkers_to_use <- paste0(biomarkers_to_use, "_corrected")
+    print("✓ ComBat batch correction completed")
+    
+  }, error = function(e) {
+    print(paste("ComBat failed:", e$message))
+    print("Using original biomarkers without batch correction")
+  })
+# }
+
+
+
+
+# =============================================================================
+# 2. CORRELATION ANALYSIS
+# =============================================================================
+
+# Calculate correlations with tumor volume
+correlations.alireza <- df.tumor_vol %>%
+  dplyr::filter(cohort %in% "Alireza") %>%
+  dplyr::select(tumor_volume, log_tumor_volume, all_of(biomarkers_to_use)) %>%
+  cor(use = "complete.obs")
+
+correlations.andrew <- df.tumor_vol %>%
+  dplyr::filter(cohort %in% "Andrew") %>%
+  dplyr::select(tumor_volume, log_tumor_volume, all_of(biomarkers_to_use)) %>%
+  cor(use = "complete.obs")
+
+# print("Correlations with tumor volume:")
+tumor_cors.alireza <- t(correlations.alireza[c("tumor_volume", "log_tumor_volume"), biomarkers_to_use])
+tumor_cors.andrew <- t(correlations.andrew[c("tumor_volume", "log_tumor_volume"), biomarkers_to_use])
+
+df.tc.alireza <- data.frame(tumor_cors.alireza) %>% dplyr::mutate(cohort = "Alireza")
+df.tc.alireza$biomarker <- rownames(df.tc.alireza)
+
+df.tc.andrew <- data.frame(tumor_cors.andrew) %>% dplyr::mutate(cohort = "Andrew")
+df.tc.andrew$biomarker <- rownames(df.tc.andrew)
+
+df.tumor.cor <- bind_rows(df.tc.alireza, df.tc.andrew)
+
+df.tumor.cor %>%
+  dplyr::arrange(biomarker, log_tumor_volume) %>%
+  ggplot(aes(x = log_tumor_volume, y = biomarker , color = cohort)) + 
+  geom_point(size = 4) + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  labs(x = "Correlation (Tumor Volume vs. Plasma [Biomarker])") + 
+  theme_miko(legend  =T, grid = T)  +
+  ggthemes::scale_color_ptol() + 
+  labs(title = "Tumor Burden Correlatates")
+
+
+
+
+# =============================================================================
+# 3. INDIVIDUAL BIOMARKER MODELS
+# =============================================================================
+
+# Function to evaluate individual biomarker performance
+evaluate_single_biomarker <- function(data, biomarker, target = "log_tumor_volume") {
+  # Fit linear model
+  formula_str <- paste(target, "~", biomarker)
+  model <- lm(as.formula(formula_str), data = data)
+  
+  # Extract model statistics
+  model_stats <- broom::glance(model)
+  
+  # Calculate additional metrics
+  predictions <- predict(model)
+  actual <- data[[target]]
+  
+  results <- list(
+    biomarker = biomarker,
+    r_squared = model_stats$r.squared,
+    adj_r_squared = model_stats$adj.r.squared,
+    p_value = model_stats$p.value,
+    rmse = rmse(actual, predictions),
+    mae = mae(actual, predictions),
+    correlation = cor(actual, predictions),
+    model = model
+  )
+  
+  return(results)
+}
+
+
+### NOT BATCH CORRECTED #####
+# library(purrr)
+# Evaluate each biomarker individually
+single_biomarker_results <- purrr::map(select.biomarker, 
+                                ~evaluate_single_biomarker(df.tumor_vol, .x))
+names(single_biomarker_results) <- select.biomarker
+
+# Create summary table
+single_performance <- map_dfr(single_biomarker_results, ~{
+  data.frame(
+    biomarker = .x$biomarker,
+    r_squared = .x$r_squared,
+    adj_r_squared = .x$adj_r_squared,
+    p_value = .x$p_value,
+    rmse = .x$rmse,
+    mae = .x$mae,
+    correlation = .x$correlation
+  )
+}) %>%
+  arrange(desc(r_squared))
+
+print("Individual biomarker performance (sorted by R²):")
+print(single_performance)
+
+
+
+# =============================================================================
+# 4. MULTIPLE REGRESSION MODELS
+# =============================================================================
+
+# Set up cross-validation
+set.seed(123)
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  returnResamp = "all"
+)
+
+# Model 1: Linear regression with all biomarkers
+print("Fitting multiple linear regression...")
+lm_model <- train(
+  log_tumor_volume ~ FABP4 + GFAP + MMP1 + MMP3 + MMP9 + NEFL + Tau,
+  data = df.tumor_vol,
+  method = "lm",
+  trControl = train_control
+)
+
+# Model 2: Ridge regression (handles multicollinearity)
+print("Fitting ridge regression...")
+ridge_model <- train(
+  log_tumor_volume ~ FABP4 + GFAP + MMP1 + MMP3 + MMP9 + NEFL + Tau,
+  data = df.tumor_vol,
+  method = "ridge",
+  trControl = train_control,
+  tuneLength = 10
+)
+
+# Model 3: Lasso regression (feature selection)
+print("Fitting lasso regression...")
+lasso_model <- train(
+  log_tumor_volume ~ FABP4 + GFAP + MMP1 + MMP3 + MMP9 + NEFL + Tau,
+  data = df.tumor_vol,
+  method = "lasso",
+  trControl = train_control,
+  tuneLength = 10
+)
+
+# Model 4: Random Forest (non-linear relationships)
+print("Fitting random forest...")
+rf_model <- train(
+  log_tumor_volume ~ FABP4 + GFAP + MMP1 + MMP3 + MMP9 + NEFL + Tau,
+  data = df.tumor_vol,
+  method = "rf",
+  trControl = train_control,
+  tuneLength = 5,
+  ntree = 500
+)
+
+
+# =============================================================================
+# 5. MODEL COMPARISON
+# =============================================================================
+
+# Compare models
+model_comparison <- resamples(list(
+  "Linear" = lm_model,
+  "Ridge" = ridge_model,
+  "Lasso" = lasso_model,
+  "Random Forest" = rf_model
+))
+
+print("Model comparison summary:")
+print(summary(model_comparison))
+
+# Get best performing model
+best_rmse <- which.min(c(
+  lm_model$results$RMSE,
+  min(ridge_model$results$RMSE),
+  min(lasso_model$results$RMSE),
+  min(rf_model$results$RMSE)
+))
+
+model_names <- c("Linear", "Ridge", "Lasso", "Random Forest")
+best_model_name <- model_names[best_rmse]
+print(paste("Best performing model:", best_model_name))
+
+
+# =============================================================================
+# 6. FEATURE IMPORTANCE ANALYSIS
+# =============================================================================
+
+# Linear model coefficients
+lm_final <- lm(log_tumor_volume ~ FABP4 + GFAP + MMP1 + MMP3 + MMP9 + NEFL + Tau,
+               data = df.tumor_vol)
+print("Linear model coefficients:")
+print(summary(lm_final))
+
+# =============================================================================
+# 7. PREDICTION RELIABILITY ASSESSMENT
+# =============================================================================
+
+# Function to assess prediction reliability
+assess_prediction_reliability <- function(model, data, target = "log_tumor_volume") {
+  # Get cross-validation predictions
+  cv_predictions <- model$pred
+  
+  # Calculate metrics
+  cv_r2 <- cor(cv_predictions$obs, cv_predictions$pred)^2
+  cv_rmse <- rmse(cv_predictions$obs, cv_predictions$pred)
+  cv_mae <- mae(cv_predictions$obs, cv_predictions$pred)
+  
+  # Calculate prediction intervals
+  residuals <- cv_predictions$obs - cv_predictions$pred
+  rmse_val <- sqrt(mean(residuals^2))
+  
+  # Reliability assessment
+  reliability_score <- case_when(
+    cv_r2 >= 0.7 ~ "High",
+    cv_r2 >= 0.5 ~ "Moderate", 
+    cv_r2 >= 0.3 ~ "Low",
+    TRUE ~ "Poor"
+  )
+  
+  return(list(
+    cv_r2 = cv_r2,
+    cv_rmse = cv_rmse,
+    cv_mae = cv_mae,
+    reliability = reliability_score,
+    prediction_error_sd = sd(residuals)
+  ))
+}
+
+# Assess each model
+model_reliability <- list(
+  "Linear" = assess_prediction_reliability(lm_model, df.tumor_vol),
+  "Ridge" = assess_prediction_reliability(ridge_model, df.tumor_vol),
+  "Lasso" = assess_prediction_reliability(lasso_model, df.tumor_vol),
+  "Random Forest" = assess_prediction_reliability(rf_model, df.tumor_vol)
+)
+
+print("Prediction reliability assessment:")
+reliability_summary <- map_dfr(model_reliability, ~{
+  data.frame(
+    cv_r2 = .x$cv_r2,
+    cv_rmse = .x$cv_rmse,
+    cv_mae = .x$cv_mae,
+    reliability = .x$reliability,
+    error_sd = .x$prediction_error_sd
+  )
+}, .id = "model")
+
+print((reliability_summary))
+
+
+
+# =============================================================================
+# 8. FINAL ASSESSMENT AND RECOMMENDATIONS
+# =============================================================================
+
+# cat("\n" , "="*60, "\n")
+cat("FINAL ASSESSMENT: BIOMARKER RELIABILITY FOR TUMOR VOLUME PREDICTION\n")
+# cat("="*60, "\n\n")
+
+# Overall assessment
+best_r2 <- max(reliability_summary$cv_r2)
+best_model_overall <- reliability_summary$model[which.max(reliability_summary$cv_r2)]
+
+cat("Dataset characteristics:\n")
+cat(sprintf("- Sample size: %d GBM patients\n", nrow(df.tumor_vol)))
+cat(sprintf("- Biomarkers tested: %d\n", length(select.biomarker)))
+cat(sprintf("- Target variable: log-transformed tumor volume\n\n"))
+
+cat("Best performing model:\n")
+cat(sprintf("- Model type: %s\n", best_model_overall))
+cat(sprintf("- Cross-validated R²: %.3f\n", best_r2))
+cat(sprintf("- Reliability rating: %s\n", 
+    reliability_summary$reliability[which.max(reliability_summary$cv_r2)]))
+cat(sprintf("- Prediction RMSE: %.3f\n", 
+    reliability_summary$cv_rmse[which.max(reliability_summary$cv_r2)]))
+
+cat("\nTop performing individual biomarkers:\n")
+top_biomarkers <- head(single_performance, 3)
+for(i in 1:nrow(top_biomarkers)) {
+  cat(sprintf("- %s: R² = %.3f, p = %.3f\n", 
+      top_biomarkers$biomarker[i], 
+      top_biomarkers$r_squared[i],
+      top_biomarkers$p_value[i]))
+}
+
+cat("\nReliability conclusion:\n")
+if(best_r2 >= 0.7) {
+  cat("✓ HIGH RELIABILITY: Biomarkers can reliably predict tumor volume\n")
+} else if(best_r2 >= 0.5) {
+  cat("△ MODERATE RELIABILITY: Biomarkers show promise but limited predictive power\n")
+} else if(best_r2 >= 0.3) {
+  cat("▽ LOW RELIABILITY: Biomarkers have weak predictive ability\n")
+} else {
+  cat("✗ POOR RELIABILITY: Biomarkers cannot reliably predict tumor volume\n")
+}
+
+cat(sprintf("\nRecommendations:\n"))
+if(best_r2 >= 0.5) {
+  cat("- Consider using the biomarker panel for tumor volume estimation\n")
+  cat("- Validate findings in an independent cohort\n")
+  cat("- Explore additional biomarkers to improve prediction\n")
+} else {
+  cat("- Current biomarkers insufficient for reliable tumor volume prediction\n")
+  cat("- Consider imaging-based approaches or additional molecular markers\n")
+  cat("- Investigate non-linear relationships or interaction effects\n")
+}
+
+```
+
+
+
+```{r expression_distributions, fig.width=12, fig.height=6}
+# =============================================================================
+# EXPRESSION DISTRIBUTIONS BY DIAGNOSIS AND COHORT
+# =============================================================================
+
+#' Analyze expression distributions across diagnoses and cohorts
+analyze_expression_distributions <- function(data, biomarkers) {
+  plt.list <- list()
+  
+  for (biomarker in biomarkers) {
+    # Prepare data
+    df_current <- data %>%
+      mutate(
+        expr = .data[[biomarker]],
+        expr_log = log10(expr + 1)
+      )
+    
+    # Count cohorts with data
+    n_cohort <- n_distinct(df_current$cohort[!is.na(df_current$expr)])
+    
+    # Statistical tests
+    p_summary <- kt_summary <- NULL
+    
+    if (n_cohort > 1) {
+      # Two-way ANOVA
+      tryCatch({
+        aov_res <- aov(expr_log ~ cohort + diagnosis, data = df_current)
+        aov_summary <- summary(aov_res)
+        
+        cohort_pval <- aov_summary[[1]][["Pr(>F)"]][1]
+        diagnosis_pval <- aov_summary[[1]][["Pr(>F)"]][2]
+        
+        p_summary <- sprintf(
+          "2-way ANOVA: cohort p=%s, diagnosis p=%s",
+          format_pval(cohort_pval),
+          format_pval(diagnosis_pval)
+        )
+      }, error = function(e) NULL)
+      
+      # Kruskal-Wallis test for GBM only
+      tryCatch({
+        kt_result <- kruskal.test(
+          expr ~ cohort, 
+          data = filter(df_current, diagnosis == "GBM")
+        )$p.value
+        
+        kt_summary <- sprintf(
+          "Kruskal-Wallis (GBM only): cohort p=%s",
+          format_pval(kt_result)
+        )
+      }, error = function(e) NULL)
+    } else {
+      # Single cohort - test diagnosis only
+      tryCatch({
+        kt_result <- kruskal.test(expr ~ diagnosis, data = df_current)$p.value
+        kt_summary <- sprintf(
+          "Kruskal-Wallis: diagnosis p=%s",
+          format_pval(kt_result)
+        )
+      }, error = function(e) NULL)
+    }
+    
+    # Create plot
+    p <- df_current %>%
+      filter(grepl("Astrocytoma|Meningioma|GBM|Oligodendro|Metast|Pituit|Schwann", diagnosis)) %>%
+      mutate(
+        diagnosis = factor(
+          diagnosis,
+          levels = c(
+            "Meningioma, grade 1", 
+            "Atypical Meningioma, grade 2",
+            "Oligodendroglioma", 
+            "Astrocytoma", 
+            "GBM",
+            "Metastatic Adenocarcinoma (LUNG)",
+            "Metastatic Carcinoma (MELANOMA)",
+            "Pituitary Adenoma",
+            "Schwannoma, grade 1"
+          )
+        )
+      ) %>%
+      dplyr::filter(!is.na(diagnosis)) %>%
+      ggplot(aes(x = expr, fill = cohort, color = cohort)) +
+      geom_density(alpha = 0.2) +
+      facet_wrap(~diagnosis, nrow = 2, scales = "free_y") +
+      scale_x_log10() +
+      labs(
+        x = "Plasma Concentration (log-transformed)",
+        y = "Density",
+        title = biomarker,
+        caption = paste(c(p_summary, kt_summary), collapse = "\n")
+      ) +
+      theme_miko(legend = TRUE)
+    
+    print(p)
+    plt.list[[biomarker]] <- p
+  }
+  
+  return(plt.list)
+}
+
+# Helper function for p-value formatting
+format_pval <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return(sprintf("%.1e***", p))
+  if (p < 0.01) return(sprintf("%.3f**", p))
+  if (p < 0.05) return(sprintf("%.3f*", p))
+  return(sprintf("%.3f", p))
+}
+
+# Run analysis
+distribution_plots <- analyze_expression_distributions(df.dat, BIOMARKER_LIST)
+
+```
+
+```{r recurrence_analysis, fig.width=12*4/5, fig.height=4}
+# =============================================================================
+# DIAGNOSIS-SPECIFIC RECURRENCE ANALYSIS
+# =============================================================================
+
+analyze_recurrence_status <- function(data, biomarkers, diagnosis_filter = "GBM") {
+  plt.list <- list()
+  
+  for (biomarker in biomarkers) {
+    df_current <- data %>%
+      mutate(
+        expr = .data[[biomarker]],
+        expr_log = log10(expr + 1)
+      ) %>%
+      filter(diagnosis == diagnosis_filter)
+    
+    n_cohort <- n_distinct(df_current$cohort[!is.na(df_current$expr)])
+    
+    if (n_cohort < 2) next
+    
+    n_samples <- sum(!is.na(df_current$expr))
+    
+    # Statistical analysis
+    p_summary <- NULL
+    tryCatch({
+      aov_res <- aov(expr_log ~ cohort + recurrence_status, data = df_current)
+      aov_summary <- summary(aov_res)
+      
+      cohort_pval <- aov_summary[[1]][["Pr(>F)"]][1]
+      recurrence_pval <- aov_summary[[1]][["Pr(>F)"]][2]
+      
+      p_summary <- sprintf(
+        "2-way ANOVA: cohort p=%s, recurrence p=%s",
+        format_pval(cohort_pval),
+        format_pval(recurrence_pval)
+      )
+    }, error = function(e) NULL)
+    
+    # Create plot
+    p <- df_current %>%
+      filter(!is.na(recurrence_status)) %>%
+      mutate(
+        recurrence_status = factor(
+          recurrence_status,
+          levels = c("Primary", "Recurrent")
+        )
+      ) %>%
+      ggplot(aes(x = recurrence_status, y = expr, 
+                 fill = recurrence_status, color = recurrence_status)) +
+      geom_boxplot(alpha = 0.2) +
+      ggbeeswarm::geom_quasirandom(alpha = 0.3) +
+      facet_wrap(~cohort, nrow = 1) +
+      scale_y_log10() +
+      labs(
+        y = "Plasma Concentration\n(Log-Transformed)",
+        x = "Recurrence Status",
+        title = biomarker,
+        subtitle = sprintf("n = %d %s samples", n_samples, diagnosis_filter),
+        caption = p_summary
+      ) +
+      theme_miko(legend = TRUE, fill.palette = "ptol", color.palette = "ptol")
+    
+    print(p)
+    plt.list[[biomarker]] <- p
+  }
+  
+  return(plt.list)
+}
+
+# Run recurrence analysis
+recurrence_plots <- analyze_recurrence_status(df.dat, BIOMARKER_LIST, "GBM")
+```
+
+```{r regression_models, fig.width=12, fig.height=5}
+# =============================================================================
+# UNIVARIATE AND MULTIVARIATE REGRESSION MODELS
+# =============================================================================
+
+#' Perform comprehensive regression analysis for biomarkers
+perform_regression_analysis <- function(data, biomarkers, diagnosis_filter = "GBM") {
+  plot.list <- list()
+  
+  # Define predictors
+  predictors <- c("cohort", "diagnosis", "age", "recurrence_status", "sex")
+  
+  for (biomarker in biomarkers) {
+    # Prepare data
+    df_analysis <- data %>%
+      filter(grepl(diagnosis_filter, diagnosis)) %>%
+      mutate(
+        expr_log = scale(log10(.data[[biomarker]] + 1)),
+        diagnosis = factor(diagnosis),
+        cohort = factor(cohort, levels = c("Ati", "Alireza", "Andrew")),
+        recurrence_status = factor(recurrence_status, levels = c("Primary", "Recurrent"))
+      ) %>%
+      dplyr::select(all_of(c(predictors, "expr_log")))
+    
+    # Run univariate models
+    univariate_results <- run_univariate_models(df_analysis, predictors)
+    
+    # Run multivariate model
+    multivariate_results <- run_multivariate_model(df_analysis, predictors)
+    
+    colnames(multivariate_results$results) <- c("Term" ,     "Estimate",  "std.error", "statistic", "P_value",   "CI_lower",  "CI_upper")
+
+    # Create visualization
+    combined_plot <- create_regression_plot(
+      univariate_results$results,
+      multivariate_results$results,
+      multivariate_results$stats,
+      biomarker
+    )
+    
+    
+    
+    print(combined_plot)
+    plot.list[[biomarker]] <- combined_plot
+  }
+  
+  return(plot.list)
+}
+
+#' Run univariate regression models
+run_univariate_models <- function(data, predictors) {
+  models <- list()
+  results <- data.frame()
+  
+  for (predictor in predictors) {
+    formula_uni <- as.formula(paste0("expr_log ~ ", predictor))
+    
+    tryCatch({
+      model <- lm(formula_uni, data = data)
+      
+      # Extract results
+      coef_summary <- summary(model)$coefficients
+      conf_int <- confint(model)
+      
+      # Skip intercept
+      if (nrow(coef_summary) > 1) {
+        for (i in 2:nrow(coef_summary)) {
+          results <- rbind(results, data.frame(
+            Predictor = predictor,
+            Term = rownames(coef_summary)[i],
+            Estimate = coef_summary[i, "Estimate"],
+            CI_lower = conf_int[i, 1],
+            CI_upper = conf_int[i, 2],
+            P_value = coef_summary[i, "Pr(>|t|)"],
+            R_squared = summary(model)$r.squared,
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+      
+      models[[predictor]] <- model
+    }, error = function(e) NULL)
+  }
+  
+  return(list(models = models, results = results))
+}
+
+#' Run multivariate regression model
+run_multivariate_model <- function(data, predictors) {
+  # Remove complete cases only
+  data_complete <- na.omit(data)
+  
+  # Check which predictors have variation
+  valid_predictors <- predictors[
+    sapply(predictors, function(p) {
+      length(unique(data_complete[[p]])) > 1
+    })
+  ]
+  
+  # Fit model
+  formula_multi <- as.formula(
+    paste0("expr_log ~ ", paste(valid_predictors, collapse = " + "))
+  )
+  
+  model <- lm(formula_multi, data = data_complete)
+  
+  # Extract results
+  results <- broom::tidy(model, conf.int = TRUE)
+  stats <- broom::glance(model)
+  
+  return(list(model = model, results = results, stats = stats))
+}
+
+#' Create regression visualization
+create_regression_plot <- function(uni_results, multi_results, multi_stats, biomarker) {
+  # Process univariate results
+  uni_plot_data <- uni_results %>%
+    filter(Term != "(Intercept)") %>%
+    mutate(
+      Term = clean_term_names(Term),
+      sig_color = ifelse(P_value < 0.05, "Significant", "Not Significant"),
+      significance = case_when(
+        P_value < 0.001 ~ "***",
+        P_value < 0.01 ~ "**",
+        P_value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  # Create univariate plot
+  p_uni <- create_coefficient_plot(
+    uni_plot_data, 
+    paste0("Predictors of ", biomarker, " Expression"),
+    "Univariate Regression"
+  )
+  
+  # Process multivariate results
+  multi_plot_data <- multi_results %>%
+    filter(Term != "(Intercept)") %>%
+    mutate(
+      Term = clean_term_names(Term),
+      sig_color = ifelse(P_value < 0.05, "Significant", "Not Significant"),
+      significance = case_when(
+        P_value < 0.001 ~ "***",
+        P_value < 0.01 ~ "**",
+        P_value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  # Create multivariate plot
+  p_multi <- create_coefficient_plot(
+    multi_plot_data,
+    " ",
+    "Multivariate Regression"
+  )
+  
+  # Create stats table
+  stats_df <- data.frame(
+    Metric = c("R²", "Adjusted R²", "F-statistic", "p-value", "Sample size"),
+    Value = c(
+      sprintf("%.3f", multi_stats$r.squared),
+      sprintf("%.3f", multi_stats$adj.r.squared),
+      sprintf("%.2f", multi_stats$statistic),
+      format_pval(multi_stats$p.value),
+      sprintf("%d", multi_stats$nobs)
+    )
+  )
+  
+  stats_table <- gridExtra::tableGrob(stats_df, rows = NULL)
+  stats_plot <- ggplot() + 
+    theme_void() +
+    annotation_custom(stats_table)
+  
+  # Combine plots
+  cowplot::plot_grid(
+    p_uni, p_multi, stats_plot,
+    ncol = 3,
+    rel_widths = c(4, 4, 1)
+  )
+}
+
+#' Clean term names for display
+clean_term_names <- function(terms) {
+  terms %>%
+    gsub("cohort", "Cohort: ", .) %>%
+    gsub("diagnosis", "Diagnosis: ", .) %>%
+    gsub("recurrence_status", "Recurrence: ", .) %>%
+    gsub("sex", "Sex: ", .) %>%
+    gsub("age", "Age", .)
+}
+
+#' Create coefficient plot
+create_coefficient_plot <- function(data, title, subtitle) {
+  ggplot(data, aes(x = Estimate, y = reorder(Term, Estimate), color = sig_color)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_point(size = 3) +
+    geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+    geom_text(aes(label = significance), vjust = -0.5, hjust = -0.2, size = 4) +
+    scale_color_manual(
+      values = c("Significant" = "tomato", "Not Significant" = "grey"),
+      name = "Statistical Significance"
+    ) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Coefficient Estimate",
+      y = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+# Run regression analysis
+regression_plots <- perform_regression_analysis(df.dat, BIOMARKER_LIST, "GBM")
+
+```
+
+```{r dimensionality_reduction}
+# =============================================================================
+# DIMENSIONALITY REDUCTION (UMAP)
+# =============================================================================
+
+#' Perform UMAP analysis on proteomics data
+perform_umap_analysis <- function(data, biomarkers) {
+  # Prepare expression matrix
+  expr_matrix <- data %>%
+    dplyr::select((biomarkers)) %>%
+    t()
+  
+  # Remove rows with any NA
+  expr_matrix <- expr_matrix[complete.cases(expr_matrix), ]
+  
+  # Set sample names
+  colnames(expr_matrix) <- make.names(data$MSD_ID)
+  
+  # Prepare metadata
+  meta_data <- data %>%
+    dplyr::select(-all_of(biomarkers))
+  rownames(meta_data) <- make.names(data$MSD_ID)
+  
+  # Create Seurat object
+  seurat_obj <- CreateSeuratObject(expr_matrix)
+  seurat_obj@meta.data <- bind_cols(seurat_obj@meta.data, meta_data)
+  
+  # Standard Seurat workflow
+  n_dims <- min(ncol(seurat_obj) - 1, nrow(seurat_obj) - 1)
+  seurat_obj <- seurat_obj %>%
+    NormalizeData(normalization.method = "LogNormalize", scale.factor = 10000) %>%
+    FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+    ScaleData(features = rownames(seurat_obj)) %>%
+    RunPCA(npcs = n_dims)
+  
+  # Run UMAP
+  seurat_obj <- seurat_obj %>%
+    FindNeighbors(dims = 1:n_dims) %>%
+    FindClusters(resolution = 0.5) %>%
+    RunUMAP(dims = 1:n_dims)
+  
+  return(seurat_obj)
+}
+
+# Perform UMAP analysis
+# data = df.dat
+# biomarkers = BIOMARKER_LIST
+seurat_all <- perform_umap_analysis(data = df.dat, biomarkers = BIOMARKER_LIST)
+
+# Visualize UMAP
+p_diagnosis <- cluster.UMAP(seurat_all, "diagnosis", pt.size = 3, include.labels = FALSE) +
+  # theme_miko(color.palette = "ptol", legend = TRUE) +
+  labs(
+    title = "Plasma Proteomics UMAP",
+    subtitle = paste(rownames(seurat_all), collapse = ", "),
+    color = "WHO 2021 Diagnosis"
+  )
+
+p_cohort <- cluster.UMAP(seurat_all, "cohort", pt.size = 3, include.labels = FALSE) +
+  # theme_miko(color.palette = "ptol", legend = TRUE) +
+  labs(
+    title = "Plasma Proteomics UMAP",
+    subtitle = paste(rownames(seurat_all), collapse = ", "),
+    color = "Cohort"
+  )
+
+print(p_diagnosis)
+print(p_cohort)
+```
+
+
+```{r}
+
+df.umap <-getUMAP(seurat_all)[["df.umap"]]
+
+
+df.umap$diagnosis_v2 <- df.umap$diagnosis
+df.umap$diagnosis_v2[grepl("Metastati", df.umap$diagnosis)] <- "Brain Metastasis"
+df.umap$diagnosis_v2[grepl("Meningioma", df.umap$diagnosis)] <- "Meningioma"
+df.umap$diagnosis_v2[grepl("Epilepsy|Normal", df.umap$diagnosis)] <- "Normal"
+df.umap$diagnosis_v2[grepl("Astroc|Oligoden", df.umap$diagnosis)] <- "Glioma (oligo, astro)"
+df.umap$diagnosis_v2[grepl("Primary", df.umap$diagnosis)] <- NA
+
+
+plt.list <- list()
+udiag <- unique(df.umap$diagnosis_v2)
+udiag <- udiag[!is.na(udiag)]
+for (i in 1:length(udiag)){
+  
+  df.umap.current <- df.umap
+ df.umap.current$diag.flag <- df.umap.current$diagnosis_v2 %in% udiag[i]
+ plt.list[[udiag[i]]] <-  df.umap.current %>%
+  ggplot(aes(x = x, y  = y, color =  diag.flag)) +
+  geom_point() + 
+  scale_color_manual(values = (c("TRUE" = "tomato", "FALSE" = "grey"))) + 
+    theme_minimal() + theme_miko( ) + 
+   labs(title = udiag[i])
+ 
+ print(plt.list[[i]])
+}
+
+df.umap %>%
+  dplyr::filter(!is.na(diagnosis_v2)) %>%
+  ggplot(aes(x = x, y  = y, color =  diagnosis_v2)) +
+   theme_miko(color.palette = "ptol", legend = TRUE) +
+  geom_point(size = 2) + 
+  labs(color = "Diagnosis") + 
+    theme_minimal() + theme_miko(legend = T )
+
+```
+
+```{r fig.width=12, fig.height=6}
+
+
+cowplot::plot_grid(plotlist = plt.list, nrow = 2)
+
+
+
+```
+
+
+
+```{r GBM classification}
+
+# =============================================================================
+# GBM CLASSIFICATION MODEL USING BIOMARKERS
+# =============================================================================
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(pROC)
+library(ROCR)
+library(corrplot)
+library(sva)
+library(limma)
+library(VIM)
+library(mice)
+library(glmnet)
+library(kernlab)
+library(nnet)
+library(klaR)
+
+
+
+# =============================================================================
+# 1. DATA PREPARATION AND PREPROCESSING
+# =============================================================================
+
+# Prepare classification dataset
+prepare_classification_data <- function(data, biomarkers) {
+  
+  # Create diagnosis groupings (consistent with your UMAP script)
+  df_class <- data %>%
+    dplyr::mutate(
+      diagnosis_v2 = case_when(
+        grepl("GBM", diagnosis, ignore.case = TRUE) ~ "GBM",
+        grepl("Metastati", diagnosis) ~ "Brain Metastasis", 
+        grepl("Meningioma", diagnosis) ~ "Meningioma",
+        grepl("Epilepsy|Normal", diagnosis) ~ "Normal",
+        grepl("Astroc|Oligoden", diagnosis) ~ "Glioma (oligo, astro)",
+        TRUE ~ "Other"
+      )
+    ) %>%
+    dplyr::filter(!is.na(diagnosis_v2), diagnosis_v2 != "Other") %>%
+    dplyr::select(c('MSD_ID', 'diagnosis', 'diagnosis_v2', 'cohort', (biomarkers))) %>%
+    drop_na()
+  
+  # Create binary GBM classification target
+  df_class <- df_class %>%
+    mutate(
+      is_GBM = factor(ifelse(diagnosis_v2 == "GBM", "GBM", "NonGBM"), 
+                     levels = c("NonGBM", "GBM")),
+      diagnosis_multi = factor(diagnosis_v2)
+    )
+  
+  return(df_class)
+}
+
+
+# Load and prepare data
+print("Preparing classification dataset...")
+df_classification <- prepare_classification_data(data = df.dat, 
+                                                 biomarkers = rownames(seurat_all))
+
+print("Dataset summary:")
+print(paste("Total samples:", nrow(df_classification)))
+print("Class distribution:")
+print(table(df_classification$diagnosis_v2))
+print("Binary GBM distribution:")
+print(table(df_classification$is_GBM))
+print("Cohort distribution:")
+print(table(df_classification$cohort))
+
+df_complete <- df_classification 
+
+# =============================================================================
+# 2. BATCH CORRECTION FOR MULTI-COHORT DATA
+# =============================================================================
+
+# Apply batch correction if multiple cohorts
+biomarkers_to_use <-  rownames(seurat_all)
+
+if(length(unique(df_complete$cohort)) > 1) {
+  
+  print("Multiple cohorts detected. Applying batch correction...")
+  
+  # Prepare biomarker matrix
+  biomarker_matrix <- df_complete %>%
+    dplyr::select(all_of(biomarkers_to_use)) %>%
+    as.matrix() %>%
+    t()
+  
+  batch_vector <- as.factor(df_complete$cohort)
+  
+  # Apply ComBat batch correction
+  tryCatch({
+    print("Applying ComBat batch correction...")
+    
+    # Create covariate matrix (preserve diagnosis information)
+    mod_matrix <- model.matrix(~ diagnosis_v2, data = df_complete)
+    
+    corrected_matrix <- ComBat(dat = biomarker_matrix, 
+                              batch = batch_vector,
+                              mod = mod_matrix,
+                              par.prior = TRUE,
+                              prior.plots = FALSE)
+    
+    # Add corrected biomarkers to dataset
+    corrected_biomarkers <- as.data.frame(t(corrected_matrix))
+    colnames(corrected_biomarkers) <- paste0(biomarkers_to_use, "_corrected")
+    
+    df_complete <- df_complete %>%
+      bind_cols(corrected_biomarkers)
+    
+    biomarkers_to_use <- paste0(biomarkers_to_use, "_corrected")
+    print("✓ ComBat batch correction completed")
+    
+  }, error = function(e) {
+    print(paste("ComBat failed:", e$message))
+    print("Using original biomarkers without batch correction")
+  })
+}
+
+print(paste("Using biomarkers:", paste(biomarkers_to_use, collapse = ", ")))
+
+
+
+# =============================================================================
+# 3. FEATURE SCALING AND CORRELATION ANALYSIS
+# =============================================================================
+
+# Scale biomarkers for machine learning
+biomarker_scaled <- df_complete %>%
+  dplyr::select((biomarkers_to_use)) %>%
+  scale() %>%
+  as.data.frame()
+
+colnames(biomarker_scaled) <- paste0(gsub("_corrected", "", biomarkers_to_use), "_scaled")
+
+# Add scaled biomarkers to dataset
+df_ml <- df_complete %>%
+  bind_cols(biomarker_scaled)
+
+biomarkers_scaled <- colnames(biomarker_scaled)
+
+# Correlation analysis
+print("Biomarker correlation analysis:")
+cor_matrix <- cor(df_ml[, biomarkers_scaled], use = "complete.obs")
+print(round(cor_matrix, 2))
+
+# Identify highly correlated features (>0.8)
+high_cor <- findCorrelation(cor_matrix, cutoff = 0.8)
+if(length(high_cor) > 0) {
+  print("Highly correlated biomarkers detected:")
+  print(biomarkers_scaled[high_cor])
+}
+
+
+# =============================================================================
+# 4. TRAIN/TEST SPLIT WITH STRATIFICATION
+# =============================================================================
+
+set.seed(123)
+
+# Stratified split maintaining class and cohort distribution
+splitIndex <- createDataPartition(
+  y = interaction(df_ml$is_GBM, df_ml$cohort), 
+  p = 0.7, 
+  list = FALSE
+)
+
+train_data <- df_ml[splitIndex, ]
+test_data <- df_ml[-splitIndex, ]
+
+print("Train/Test split:")
+print(paste("Training samples:", nrow(train_data)))
+print(paste("Test samples:", nrow(test_data)))
+print("Training set class distribution:")
+print(table(train_data$is_GBM))
+print("Test set class distribution:")
+print(table(test_data$is_GBM))
+
+
+
+# =============================================================================
+# 5. CROSS-VALIDATION SETUP
+# =============================================================================
+
+# Set up repeated cross-validation
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = "final",
+  sampling = "smote"  # Handle class imbalance
+)
+
+# Create formula for modeling
+formula_binary <- as.formula(paste("is_GBM ~", paste(biomarkers_scaled, collapse = " + ")))
+
+
+
+# =============================================================================
+# 6. BINARY CLASSIFICATION MODELS (GBM vs NON-GBM)
+# =============================================================================
+
+print("Training binary classification models (GBM vs Non-GBM)...")
+
+# Model 1: Logistic Regression
+print("Training Logistic Regression...")
+set.seed(123)
+model_glm <- train(
+  formula_binary,
+  data = train_data,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+# Model 2: Random Forest
+print("Training Random Forest...")
+set.seed(123)
+model_rf <- train(
+  formula_binary,
+  data = train_data,
+  method = "rf",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneLength = 5,
+  ntree = 500
+)
+
+# Model 3: Support Vector Machine
+print("Training Support Vector Machine...")
+set.seed(123)
+model_svm <- train(
+  formula_binary,
+  data = train_data,
+  method = "svmRadial",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneLength = 5
+)
+
+# Model 4: XGBoost
+print("Training XGBoost...")
+set.seed(123)
+model_xgb <- train(
+  formula_binary,
+  data = train_data,
+  method = "xgbTree",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneLength = 3,
+  verbosity = 0
+)
+
+# Model 5: Elastic Net
+print("Training Elastic Net...")
+set.seed(123)
+model_glmnet <- train(
+  formula_binary,
+  data = train_data,
+  method = "glmnet",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneLength = 5
+)
+
+# Model 6: Neural Network
+print("Training Neural Network...")
+set.seed(123)
+model_nnet <- train(
+  formula_binary,
+  data = train_data,
+  method = "nnet",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneLength = 3,
+  trace = FALSE,
+  maxit = 1000
+)
+
+# =============================================================================
+# 7. MODEL COMPARISON AND SELECTION
+# =============================================================================
+
+# Compare models
+binary_models <- list(
+  "Logistic" = model_glm,
+  "Random Forest" = model_rf,
+  "SVM" = model_svm,
+  "XGBoost" = model_xgb,
+  "Elastic Net" = model_glmnet,
+  "Neural Net" = model_nnet
+)
+
+# Cross-validation results
+binary_results <- resamples(binary_models)
+print("Binary classification cross-validation results:")
+print(summary(binary_results))
+
+df.model.raw <- binary_results$values
+
+
+formatRes <- function(df.model.raw, which.stat = "ROC"){
+  cn <- colnames(df.model.raw)[grepl(which.stat, colnames(df.model.raw) )]
+df.model.long <- pivot_longer(df.model.raw %>% dplyr::select(cn), cols = cn) 
+df.model.long$name <- gsub(paste0("~",which.stat), "", df.model.long$name)
+return(df.model.long)
+}
+
+pltPerformance <- function(df.model.long,  which.order, which.stat){
+  df.model.long %>%
+  dplyr::mutate(name = factor(name, levels =  as.character(which.order))) %>%
+  ggplot(aes(x = value, y = name)) + 
+  geom_boxplot(fill = "grey") + 
+  ggbeeswarm::geom_beeswarm(groupOnX = F) + 
+  labs(x= which.stat, y = "Classification Model") + 
+  theme_miko()
+}
+                               
+df.model.roc.long <- formatRes(df.model.raw = df.model.raw, which.stat = "ROC")
+df.model.sens.long <- formatRes(df.model.raw = df.model.raw, which.stat = "Sens")
+df.model.spec.long <- formatRes(df.model.raw = df.model.raw, which.stat = "Spec")
+
+df.model.roc.sum <- df.model.roc.long %>% 
+  dplyr::group_by(name) %>% 
+  dplyr::summarize(roc.median = median(value)) %>%
+  dplyr::arrange(roc.median, name)
+
+df.model.sens.sum <- df.model.sens.long %>% 
+  dplyr::group_by(name) %>% 
+  dplyr::summarize(roc.median = median(value)) %>%
+  dplyr::arrange(roc.median, name)
+
+df.model.spec.sum <- df.model.spec.long %>% 
+  dplyr::group_by(name) %>% 
+  dplyr::summarize(roc.median = median(value)) %>%
+  dplyr::arrange(roc.median, name)
+
+p1 <- pltPerformance(df.model.long = df.model.roc.long,  which.order = df.model.roc.sum$name, which.stat = "ROC")
+p2 <- pltPerformance(df.model.long = df.model.sens.long,  which.order = df.model.roc.sum$name, which.stat = "Sens")
+p3 <- pltPerformance(df.model.long = df.model.spec.long,  which.order = df.model.roc.sum$name, which.stat = "Spec")
+
+plt.performance <- cowplot::plot_grid(p1, p2, p3, nrow = 1 )
+
+# Select best model
+best_model_name <- binary_results$models[which.max(apply(binary_results$values[,grep("ROC", names(binary_results$values))], 2, mean))]
+best_model <- binary_models[[best_model_name]]
+
+print(paste("Best performing model:", best_model_name))
+print(paste("Cross-validated AUC:", round(max(apply(binary_results$values[,grep("ROC", names(binary_results$values))], 2, median)), 3)))
+print(paste("Cross-validated Sensitivity:", round(max(apply(binary_results$values[,grep("Sens", names(binary_results$values))], 2, median)), 3)))
+print(paste("Cross-validated Specificity:", round(max(apply(binary_results$values[,grep("Spec", names(binary_results$values))], 2, median)), 3)))
+
+
+# =============================================================================
+# 8. TEST SET EVALUATION
+# =============================================================================
+
+print("Evaluating models on test set...")
+
+# Generate predictions for all models
+test_predictions <- purrr::map(binary_models, ~{
+  pred_prob <- predict(.x, test_data, type = "prob")
+  pred_class <- predict(.x, test_data, type = "raw")
+  
+  list(
+    probabilities = pred_prob,
+    predictions = pred_class,
+    actual = test_data$is_GBM
+  )
+})
+
+
+train_predictions <- purrr::map(binary_models, ~{
+  pred_prob <- predict(.x, train_data, type = "prob")
+  pred_class <- predict(.x, train_data, type = "raw")
+  
+  list(
+    probabilities = pred_prob,
+    predictions = pred_class,
+    actual = test_data$is_GBM
+  )
+})
+
+pred_list <- test_predictions[[1]]
+
+# Calculate performance metrics
+calculate_metrics <- function(pred_list) {
+  
+  # Confusion Matrix
+  cm <- caret::confusionMatrix(pred_list$predictions, pred_list$actual,  positive = "GBM")
+  # cm <- confusionMatrix(pred_list$predictions, pred_list$actual, positive = "GBM")
+  # ROC curve
+  roc_obj <- roc(pred_list$actual, pred_list$probabilities$GBM)
+  
+  # Metrics
+  metrics <- list(
+    accuracy = cm$overall["Accuracy"],
+    sensitivity = cm$byClass["Sensitivity"],
+    specificity = cm$byClass["Specificity"],
+    ppv = cm$byClass["Pos Pred Value"],
+    npv = cm$byClass["Neg Pred Value"],
+    f1 = cm$byClass["F1"],
+    auc = as.numeric(auc(roc_obj)),
+    confusion_matrix = cm$table,
+    roc = roc_obj
+  )
+  
+  return(metrics)
+}
+
+# Calculate metrics for all models
+test_metrics <- purrr::map(test_predictions, calculate_metrics)
+
+# Create performance summary table
+performance_summary <- map_dfr(test_metrics, ~{
+  data.frame(
+    Accuracy = .x$accuracy,
+    Sensitivity = .x$sensitivity,
+    Specificity = .x$specificity,
+    PPV = .x$ppv,
+    NPV = .x$npv,
+    F1 = .x$f1,
+    AUC = .x$auc
+  )
+}, .id = "Model")
+
+print("Test set performance summary:")
+print((performance_summary))
+
+
+# =============================================================================
+# 10. FEATURE IMPORTANCE ANALYSIS
+# =============================================================================
+
+# Feature importance from best model
+if(best_model_name %in% c("Random Forest", "XGBoost")) {
+  importance_scores <- varImp(best_model)
+  print(paste("Feature importance from", best_model_name, ":"))
+  print(importance_scores)
+  
+ df.importance <- importance_scores[["importance"]]
+ df.importance$feature <- gsub("_scaled", "", rownames(df.importance))
+ df.importance$importance_score <- df.importance$Overall
+  
+ df.importance <- df.importance %>% dplyr::arrange(importance_score)
+ df.importance$feature <- factor(df.importance$feature, levels = df.importance$feature)
+df.importance %>%
+  dplyr::arrange(importance_score) %>%
+  ggplot(aes(x = importance_score, y = feature)) + 
+  geom_point(size = 4) + 
+  geom_segment(aes(x = 0, xend = importance_score, y = feature, yend = feature)) + 
+  theme_miko() + 
+  labs(x = "Importance Score", y = "Biomarker", title = "Feature Importance")
+}
+
+
+```
+
+
+```{r fig.width=4, fig.height=3.5}
+
+df.importance %>%
+  dplyr::arrange(importance_score) %>%
+  ggplot(aes(x = importance_score, y = feature)) + 
+  geom_point(size = 4) + 
+  geom_segment(aes(x = 0, xend = importance_score, y = feature, yend = feature)) + 
+  theme_miko() + 
+  labs(x = "Importance Score", y = "Biomarker", title = "Feature Importance")
+```
+
+
+```{r genereate ROC plots, fig.width=5, fig.height=5}
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 1. For each model, compute a pROC::roc object on the test set, then extract
+#    (FPR, TPR) pairs. Combine into one data frame with a “model” column.
+# ────────────────────────────────────────────────────────────────────────────────
+
+roc_df <- imap_dfr(
+  test_predictions,
+  ~{
+    # .x is the list for a single model: list(probabilities, predictions, actual)
+    # .y is the model name (e.g. "Logistic", "Random Forest", etc.)
+    probs <- .x$probabilities$GBM
+    actuals <- .x$actual
+    
+    # Ensure 'actuals' is a factor whose positive class is "GBM".
+    # If 'actuals' is already a factor, pROC will detect "GBM" automatically.
+    # Otherwise, coerce to factor with levels = c(<non‐GBM>, "GBM").
+    if (!inherits(actuals, "factor")) {
+      actuals <- factor(actuals, levels = sort(unique(actuals)))
+    }
+    
+    # Compute ROC. By default pROC will assume the second level of 'actuals' is positive;
+    # if your factor is ordered differently, you can force: levels = c("NoGBM","GBM").
+    roc_obj <- roc(actuals, probs, quiet = TRUE)
+    
+    # Extract (1 – specificity) and sensitivity:
+    tibble(
+      fpr   = 1 - roc_obj$specificities,
+      tpr   =    roc_obj$sensitivities,
+      model = .y
+    )
+  }
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 2. (Optional) Compute each model’s AUC for annotation:
+# ────────────────────────────────────────────────────────────────────────────────
+
+auc_df <- imap_dfr(
+  test_predictions,
+  ~{
+    prol <- .x$probabilities$GBM
+    actl <- .x$actual
+    if (!inherits(actl, "factor")) {
+      actl <- factor(actl, levels = sort(unique(actl)))
+    }
+    auc_val <- as.numeric(auc(roc(actl, prol, quiet = TRUE)))
+    tibble(model = .y, AUC = round(auc_val, 3))
+  }
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 3. Plot all ROC curves together using ggplot2
+# ────────────────────────────────────────────────────────────────────────────────
+
+ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+  # geom_line(size = 1) +
+  geom_smooth(span = 0.25, se = F) + 
+  # Add diagonal 45° line to denote “random‐guess” baseline
+  geom_abline(
+    slope = 1, intercept = 0,
+    linetype = "dashed", color = "gray50"
+  ) +
+  labs(
+    x     = "False Positive Rate (1 − Specificity)",
+    y     = "True Positive Rate (Sensitivity)",
+    title = "ROC Curves on Test Set",
+    color = "Model"
+  ) +
+  # (Optional) annotate AUC values next to the legend
+  guides(color = guide_legend(
+    override.aes = list(label = paste0(
+      auc_df$model, " (AUC=", auc_df$AUC, ")"
+    ))
+  )) +
+  theme_miko() +
+  coord_cartesian(ylim = c(0,1), xlim = c(0,1)) + 
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 9)
+  )
+
+```
+
+
+
+```{r compare predicted GBM probabilities}
+
+df.rf.train.pred <- train_predictions[["Random Forest"]][["probabilities"]]
+df.rf.train.pred$diagnosis_multi <- train_data$diagnosis_multi
+df.rf.train.pred$diagnosis <- train_data$diagnosis
+
+df.rf.test.pred <- test_predictions[["Random Forest"]][["probabilities"]]
+df.rf.test.pred$diagnosis_multi <- test_data$diagnosis_multi
+df.rf.test.pred$diagnosis <- test_data$diagnosis
+
+
+df.rf.train.sum <- df.rf.train.pred %>% 
+  dplyr::group_by(diagnosis_multi) %>% 
+  summarize(mean.gbm = mean(GBM)) %>% dplyr::arrange(-mean.gbm)
+diag.order <- as.character(df.rf.train.sum$diagnosis_multi)
+
+df.rf.train.pred$set <- "Train"
+df.rf.test.pred$set <- "Test"
+
+df.rf.pred <- bind_rows(df.rf.train.pred, df.rf.test.pred) %>%
+  dplyr::mutate(diagnosis_multi = factor(diagnosis_multi, levels = diag.order),
+                set = factor(set, levels = c("Train", "Test")))
+
+df.rf.pred %>%
+  ggplot(aes(x = diagnosis_multi, y = GBM, fill = set)) + 
+  # 1. Dodge boxplots by set
+  geom_boxplot(
+    position = position_dodge(width = 0.8),
+    outlier.colour = NA
+  ) +
+  # 2. Dodge quasirandom points by the same width, grouped by set
+  ggbeeswarm::geom_quasirandom(
+    aes(group = set),
+    dodge.width = 0.8,
+    size = 1.5,
+    alpha = 0.8
+  ) +
+  # (Optional) match point‐colors to fill‐palette:
+  scale_fill_manual(values = c("Test" = "grey80", "Train" = "grey50")) +
+  scale_color_manual(values = c("Test" = "grey80", "Train" = "grey50")) +
+  theme_miko(x.axis.rotation = 45, legend = TRUE) + 
+  labs(
+    title = "Predicted GBM Probabilities",
+    subtitle = "Random Forest Model",
+    x = "Diagnostic Group",
+    y = "Predicted GBM Probability"
+  )
+
+
+
+```
+
+
+
+
+```{r}
+
+# =============================================================================
+# 11. MULTI-CLASS CLASSIFICATION
+# =============================================================================
+
+print("Training multi-class classification models...")
+
+# Prepare multi-class data
+train_data$diagnosis_multi2 <- make.names(train_data$diagnosis_multi)
+test_data$diagnosis_multi2 <- make.names(test_data$diagnosis_multi)
+formula_multi <- as.formula(paste("diagnosis_multi2 ~", paste(biomarkers_scaled, collapse = " + ")))
+
+# Multi-class control
+ctrl_multi <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  summaryFunction = multiClassSummary,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+
+
+
+# Train multi-class models
+set.seed(123)
+model_multi_rf <- train(
+  formula_multi,
+  data = train_data,
+  method = "rf",
+  trControl = ctrl_multi,
+  metric = "Accuracy",
+  tuneLength = 3
+)
+
+# Multi-class predictions
+pred_multi <- predict(model_multi_rf, test_data, type = "raw")
+cm_multi <- caret::confusionMatrix(pred_multi, test_data$diagnosis_multi2)
+
+print("Multi-class classification results:")
+print(cm_multi)
+
+# =============================================================================
+# 12. CLINICAL INTERPRETATION AND RELIABILITY ASSESSMENT
+# =============================================================================
+
+# Calculate diagnostic performance metrics
+best_metrics <- test_metrics[[best_model_name]]
+
+# Clinical thresholds analysis
+thresholds <- seq(0.1, 0.9, by = 0.1)
+threshold_analysis <- map_dfr(thresholds, ~{
+  
+  threshold <- .x
+  pred_thresh <- factor(
+    ifelse(test_predictions[[best_model_name]]$probabilities$GBM >= threshold, "GBM", "NonGBM"),
+    levels = c("Non-GBM", "GBM")
+  )
+  
+  cm_thresh <- caret::confusionMatrix(pred_thresh, test_data$is_GBM, positive = "GBM")
+  
+  data.frame(
+    threshold = threshold,
+    sensitivity = cm_thresh$byClass["Sensitivity"],
+    specificity = cm_thresh$byClass["Specificity"],
+    ppv = cm_thresh$byClass["Pos Pred Value"],
+    npv = cm_thresh$byClass["Neg Pred Value"]
+  )
+})
+
+print("Threshold analysis for clinical decision-making:")
+print(round(threshold_analysis, 3))
+
+# =============================================================================
+# 13. COHORT GENERALIZABILITY ANALYSIS
+# =============================================================================
+
+if(length(unique(df_ml$cohort)) > 1) {
+  print("Analyzing model generalizability across cohorts...")
+  
+  cohort_performance <- map_dfr(unique(test_data$cohort), ~{
+    
+    cohort_data <- test_data[test_data$cohort == .x, ]
+    
+    if(nrow(cohort_data) > 5) {  # Only analyze cohorts with sufficient samples
+      
+      pred_cohort <- predict(best_model, cohort_data, type = "prob")
+      actual_cohort <- cohort_data$is_GBM
+      
+      if(length(unique(actual_cohort)) == 2) {  # Only if both classes present
+        roc_cohort <- roc(actual_cohort, pred_cohort$GBM)
+        auc_cohort <- as.numeric(auc(roc_cohort))
+      } else {
+        auc_cohort <- NA
+      }
+      
+      data.frame(
+        cohort = .x,
+        n_samples = nrow(cohort_data),
+        n_gbm = sum(actual_cohort == "GBM"),
+        auc = auc_cohort
+      )
+    } else {
+      data.frame(
+        cohort = .x,
+        n_samples = nrow(cohort_data),
+        n_gbm = sum(cohort_data$is_GBM == "GBM"),
+        auc = NA
+      )
+    }
+  })
+  
+  print("Cohort-specific performance:")
+  print(cohort_performance)
+}
+
+# =============================================================================
+# 14. FINAL REPORT
+# =============================================================================
+
+cat("\n", "="*70, "\n")
+cat("FINAL ASSESSMENT: GBM CLASSIFICATION USING BIOMARKERS\n")
+cat("="*70, "\n\n")
+
+# Dataset summary
+cat("Dataset Characteristics:\n")
+cat(sprintf("- Total samples: %d\n", nrow(df_complete)))
+cat(sprintf("- GBM cases: %d (%.1f%%)\n", 
+    sum(df_complete$is_GBM == "GBM"), 
+    100 * mean(df_complete$is_GBM == "GBM")))
+cat(sprintf("- Non-GBM cases: %d (%.1f%%)\n", 
+    sum(df_complete$is_GBM == "Non-GBM"), 
+    100 * mean(df_complete$is_GBM == "Non-GBM")))
+cat(sprintf("- Number of cohorts: %d\n", length(unique(df_complete$cohort))))
+cat(sprintf("- Biomarkers used: %d\n", length(BIOMARKER_LIST)))
+cat(sprintf("- Batch correction applied: %s\n\n", 
+    ifelse(grepl("corrected", biomarkers_to_use[1]), "Yes", "No")))
+
+# Best model performance
+cat("Best Model Performance:\n")
+cat(sprintf("- Model: %s\n", best_model_name))
+cat(sprintf("- Test AUC: %.3f\n", best_metrics$auc))
+cat(sprintf("- Accuracy: %.3f\n", best_metrics$accuracy))
+cat(sprintf("- Sensitivity: %.3f\n", best_metrics$sensitivity))
+cat(sprintf("- Specificity: %.3f\n", best_metrics$specificity))
+cat(sprintf("- PPV: %.3f\n", best_metrics$ppv))
+cat(sprintf("- NPV: %.3f\n\n", best_metrics$npv))
+
+
+
+```
+
+
+
+```{r fig.width=12, fig.height=4}
+
+plt.performance
+```
+
+
+
+
+
