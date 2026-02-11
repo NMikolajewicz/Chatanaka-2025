@@ -1422,15 +1422,40 @@ safe_ci_auc <- function(roc_obj, conf.level = 0.95) {
 
 build_roc_ci_df <- function(roc_obj, model_name, conf.level = 0.95, boot.n = 1000, grid_n = 101) {
   specificities <- seq(1, 0, length.out = grid_n)
-  tpr <- as.numeric(
-    pROC::coords(
-      roc_obj,
-      x = specificities,
-      input = "specificity",
-      ret = "sensitivity",
-      transpose = FALSE
-    )
+  
+  to_numeric <- function(x, preferred_col = NULL) {
+    if (is.null(x)) {
+      return(numeric(0))
+    }
+    if (is.atomic(x)) {
+      return(as.numeric(x))
+    }
+    if (is.matrix(x) || is.data.frame(x)) {
+      if (!is.null(preferred_col) && preferred_col %in% colnames(x)) {
+        return(as.numeric(x[, preferred_col]))
+      }
+      return(as.numeric(x[, 1]))
+    }
+    if (is.list(x)) {
+      if (!is.null(preferred_col) && !is.null(x[[preferred_col]])) {
+        return(as.numeric(unlist(x[[preferred_col]], use.names = FALSE)))
+      }
+      return(as.numeric(unlist(x, use.names = FALSE)))
+    }
+    as.numeric(x)
+  }
+  
+  coords_obj <- pROC::coords(
+    roc_obj,
+    x = specificities,
+    input = "specificity",
+    ret = "sensitivity",
+    transpose = FALSE
   )
+  tpr <- to_numeric(coords_obj, preferred_col = "sensitivity")
+  if (length(tpr) != length(specificities)) {
+    tpr <- rep(NA_real_, length(specificities))
+  }
   
   ci_mat <- tryCatch(
     pROC::ci.se(roc_obj, specificities = specificities, conf.level = conf.level, boot.n = boot.n),
@@ -1448,12 +1473,21 @@ build_roc_ci_df <- function(roc_obj, model_name, conf.level = 0.95, boot.n = 100
   }
   
   ci_df <- as.data.frame(ci_mat)
+  ci_lower <- to_numeric(ci_df[, 1])
+  ci_upper <- to_numeric(ci_df[, ncol(ci_df)])
+  if (length(ci_lower) != length(tpr)) {
+    ci_lower <- tpr
+  }
+  if (length(ci_upper) != length(tpr)) {
+    ci_upper <- tpr
+  }
+  
   tibble(
     model = model_name,
     fpr = 1 - specificities,
     tpr = tpr,
-    tpr_lower = pmax(0, ci_df[, 1]),
-    tpr_upper = pmin(1, ci_df[, 3])
+    tpr_lower = pmax(0, ci_lower),
+    tpr_upper = pmin(1, ci_upper)
   )
 }
 
