@@ -1351,6 +1351,138 @@ library(kernlab)
 library(nnet)
 library(klaR)
 
+# Helper functions for 95% CI reporting across binary outcomes
+exact_binom_ci <- function(successes, total, conf.level = 0.95) {
+  if (is.na(total) || total <= 0 || is.na(successes)) {
+    return(c(estimate = NA_real_, lower = NA_real_, upper = NA_real_))
+  }
+  bt <- stats::binom.test(as.integer(successes), as.integer(total), conf.level = conf.level)
+  c(
+    estimate = as.numeric(bt$estimate),
+    lower = as.numeric(bt$conf.int[1]),
+    upper = as.numeric(bt$conf.int[2])
+  )
+}
+
+extract_binary_counts <- function(cm_table, positive = "GBM") {
+  table_mat <- as.matrix(cm_table)
+  neg_levels <- setdiff(colnames(table_mat), positive)
+  negative <- neg_levels[1]
+  
+  tp <- as.numeric(table_mat[positive, positive])
+  fp <- as.numeric(table_mat[positive, negative])
+  fn <- as.numeric(table_mat[negative, positive])
+  tn <- as.numeric(table_mat[negative, negative])
+  
+  c(tp = tp, fp = fp, fn = fn, tn = tn, total = tp + fp + fn + tn)
+}
+
+bootstrap_f1_ci <- function(predicted, actual, positive = "GBM", conf.level = 0.95,
+                            n_boot = 1000, seed = 123) {
+  preds <- as.character(predicted)
+  obs <- as.character(actual)
+  n <- length(obs)
+  negative <- setdiff(unique(c(obs, preds)), positive)[1]
+  
+  if (is.na(negative) || n == 0) {
+    return(c(lower = NA_real_, upper = NA_real_))
+  }
+  
+  f1_from_vectors <- function(pred_vec, obs_vec) {
+    tp <- sum(pred_vec == positive & obs_vec == positive, na.rm = TRUE)
+    fp <- sum(pred_vec == positive & obs_vec == negative, na.rm = TRUE)
+    fn <- sum(pred_vec == negative & obs_vec == positive, na.rm = TRUE)
+    denom <- (2 * tp) + fp + fn
+    if (denom == 0) {
+      return(NA_real_)
+    }
+    (2 * tp) / denom
+  }
+  
+  set.seed(seed)
+  boot_vals <- replicate(n_boot, {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    f1_from_vectors(preds[idx], obs[idx])
+  })
+  
+  alpha <- (1 - conf.level) / 2
+  c(
+    lower = as.numeric(stats::quantile(boot_vals, probs = alpha, na.rm = TRUE)),
+    upper = as.numeric(stats::quantile(boot_vals, probs = 1 - alpha, na.rm = TRUE))
+  )
+}
+
+safe_ci_auc <- function(roc_obj, conf.level = 0.95) {
+  out <- tryCatch(
+    as.numeric(pROC::ci.auc(roc_obj, conf.level = conf.level)),
+    error = function(e) c(NA_real_, NA_real_, NA_real_)
+  )
+  c(lower = out[1], estimate = out[2], upper = out[3])
+}
+
+build_roc_ci_df <- function(roc_obj, model_name, conf.level = 0.95, boot.n = 1000, grid_n = 101) {
+  specificities <- seq(1, 0, length.out = grid_n)
+  tpr <- as.numeric(
+    pROC::coords(
+      roc_obj,
+      x = specificities,
+      input = "specificity",
+      ret = "sensitivity",
+      transpose = FALSE
+    )
+  )
+  
+  ci_mat <- tryCatch(
+    pROC::ci.se(roc_obj, specificities = specificities, conf.level = conf.level, boot.n = boot.n),
+    error = function(e) NULL
+  )
+  
+  if (is.null(ci_mat)) {
+    return(tibble(
+      model = model_name,
+      fpr = 1 - specificities,
+      tpr = tpr,
+      tpr_lower = tpr,
+      tpr_upper = tpr
+    ))
+  }
+  
+  ci_df <- as.data.frame(ci_mat)
+  tibble(
+    model = model_name,
+    fpr = 1 - specificities,
+    tpr = tpr,
+    tpr_lower = pmax(0, ci_df[, 1]),
+    tpr_upper = pmin(1, ci_df[, 3])
+  )
+}
+
+format_ci_text <- function(estimate, lower, upper, digits = 3) {
+  if (any(is.na(c(estimate, lower, upper)))) {
+    return("NA")
+  }
+  paste0(
+    formatC(estimate, format = "f", digits = digits),
+    " (95% CI ",
+    formatC(lower, format = "f", digits = digits),
+    "-",
+    formatC(upper, format = "f", digits = digits),
+    ")"
+  )
+}
+
+summarize_resample_ci <- function(df_model_long, conf.level = 0.95) {
+  alpha <- (1 - conf.level) / 2
+  df_model_long %>%
+    dplyr::group_by(name) %>%
+    dplyr::summarize(
+      estimate = median(value, na.rm = TRUE),
+      lower = as.numeric(stats::quantile(value, probs = alpha, na.rm = TRUE)),
+      upper = as.numeric(stats::quantile(value, probs = 1 - alpha, na.rm = TRUE)),
+      .groups = "drop"
+    )
+}
+
 
 
 # =============================================================================
@@ -1679,14 +1811,43 @@ p3 <- pltPerformance(df.model.long = df.model.spec.long,  which.order = df.model
 
 plt.performance <- cowplot::plot_grid(p1, p2, p3, nrow = 1 )
 
+cv_roc_summary <- summarize_resample_ci(df.model.roc.long) %>% dplyr::mutate(metric = "ROC")
+cv_sens_summary <- summarize_resample_ci(df.model.sens.long) %>% dplyr::mutate(metric = "Sensitivity")
+cv_spec_summary <- summarize_resample_ci(df.model.spec.long) %>% dplyr::mutate(metric = "Specificity")
+
+cv_metric_summary <- bind_rows(cv_roc_summary, cv_sens_summary, cv_spec_summary) %>%
+  dplyr::mutate(
+    CI_95 = purrr::pmap_chr(
+      list(estimate, lower, upper),
+      ~ format_ci_text(..1, ..2, ..3)
+    )
+  ) %>%
+  dplyr::arrange(metric, dplyr::desc(estimate))
+
+print("Cross-validated binary classification metrics with 95% CIs:")
+print(cv_metric_summary %>% dplyr::select(name, metric, estimate, lower, upper, CI_95))
+
 # Select best model
 best_model_name <- binary_results$models[which.max(apply(binary_results$values[,grep("ROC", names(binary_results$values))], 2, mean))]
 best_model <- binary_models[[best_model_name]]
 
+best_cv_roc <- cv_roc_summary %>% dplyr::filter(make.names(name) == make.names(best_model_name))
+best_cv_sens <- cv_sens_summary %>% dplyr::filter(make.names(name) == make.names(best_model_name))
+best_cv_spec <- cv_spec_summary %>% dplyr::filter(make.names(name) == make.names(best_model_name))
+
 print(paste("Best performing model:", best_model_name))
-print(paste("Cross-validated AUC:", round(max(apply(binary_results$values[,grep("ROC", names(binary_results$values))], 2, median)), 3)))
-print(paste("Cross-validated Sensitivity:", round(max(apply(binary_results$values[,grep("Sens", names(binary_results$values))], 2, median)), 3)))
-print(paste("Cross-validated Specificity:", round(max(apply(binary_results$values[,grep("Spec", names(binary_results$values))], 2, median)), 3)))
+print(paste(
+  "Cross-validated AUC:",
+  format_ci_text(best_cv_roc$estimate[1], best_cv_roc$lower[1], best_cv_roc$upper[1])
+))
+print(paste(
+  "Cross-validated Sensitivity:",
+  format_ci_text(best_cv_sens$estimate[1], best_cv_sens$lower[1], best_cv_sens$upper[1])
+))
+print(paste(
+  "Cross-validated Specificity:",
+  format_ci_text(best_cv_spec$estimate[1], best_cv_spec$lower[1], best_cv_spec$upper[1])
+))
 
 
 # =============================================================================
@@ -1715,31 +1876,54 @@ train_predictions <- purrr::map(binary_models, ~{
   list(
     probabilities = pred_prob,
     predictions = pred_class,
-    actual = test_data$is_GBM
+    actual = train_data$is_GBM
   )
 })
 
 pred_list <- test_predictions[[1]]
 
 # Calculate performance metrics
-calculate_metrics <- function(pred_list) {
+calculate_metrics <- function(pred_list, positive_class = "GBM", conf.level = 0.95) {
   
   # Confusion Matrix
-  cm <- caret::confusionMatrix(pred_list$predictions, pred_list$actual,  positive = "GBM")
-  # cm <- confusionMatrix(pred_list$predictions, pred_list$actual, positive = "GBM")
+  cm <- caret::confusionMatrix(pred_list$predictions, pred_list$actual, positive = positive_class)
+  counts <- extract_binary_counts(cm$table, positive = positive_class)
+  
   # ROC curve
-  roc_obj <- roc(pred_list$actual, pred_list$probabilities$GBM)
+  roc_obj <- pROC::roc(
+    pred_list$actual,
+    pred_list$probabilities[[positive_class]],
+    levels = c(setdiff(levels(pred_list$actual), positive_class), positive_class),
+    quiet = TRUE
+  )
+  auc_ci <- safe_ci_auc(roc_obj, conf.level = conf.level)
+  
+  f1_ci <- bootstrap_f1_ci(
+    predicted = pred_list$predictions,
+    actual = pred_list$actual,
+    positive = positive_class,
+    conf.level = conf.level
+  )
   
   # Metrics
   metrics <- list(
-    accuracy = cm$overall["Accuracy"],
-    sensitivity = cm$byClass["Sensitivity"],
-    specificity = cm$byClass["Specificity"],
-    ppv = cm$byClass["Pos Pred Value"],
-    npv = cm$byClass["Neg Pred Value"],
-    f1 = cm$byClass["F1"],
-    auc = as.numeric(auc(roc_obj)),
+    accuracy = exact_binom_ci(counts["tp"] + counts["tn"], counts["total"], conf.level = conf.level),
+    sensitivity = exact_binom_ci(counts["tp"], counts["tp"] + counts["fn"], conf.level = conf.level),
+    specificity = exact_binom_ci(counts["tn"], counts["tn"] + counts["fp"], conf.level = conf.level),
+    ppv = exact_binom_ci(counts["tp"], counts["tp"] + counts["fp"], conf.level = conf.level),
+    npv = exact_binom_ci(counts["tn"], counts["tn"] + counts["fn"], conf.level = conf.level),
+    f1 = c(
+      estimate = as.numeric(cm$byClass["F1"]),
+      lower = as.numeric(f1_ci["lower"]),
+      upper = as.numeric(f1_ci["upper"])
+    ),
+    auc = c(
+      estimate = as.numeric(auc(roc_obj)),
+      lower = as.numeric(auc_ci["lower"]),
+      upper = as.numeric(auc_ci["upper"])
+    ),
     confusion_matrix = cm$table,
+    counts = counts,
     roc = roc_obj
   )
   
@@ -1750,17 +1934,41 @@ calculate_metrics <- function(pred_list) {
 test_metrics <- purrr::map(test_predictions, calculate_metrics)
 
 # Create performance summary table
-performance_summary <- map_dfr(test_metrics, ~{
-  data.frame(
-    Accuracy = .x$accuracy,
-    Sensitivity = .x$sensitivity,
-    Specificity = .x$specificity,
-    PPV = .x$ppv,
-    NPV = .x$npv,
-    F1 = .x$f1,
-    AUC = .x$auc
+performance_summary <- imap_dfr(test_metrics, ~{
+  tibble(
+    Model = .y,
+    Accuracy = as.numeric(.x$accuracy["estimate"]),
+    Accuracy_lower = as.numeric(.x$accuracy["lower"]),
+    Accuracy_upper = as.numeric(.x$accuracy["upper"]),
+    Sensitivity = as.numeric(.x$sensitivity["estimate"]),
+    Sensitivity_lower = as.numeric(.x$sensitivity["lower"]),
+    Sensitivity_upper = as.numeric(.x$sensitivity["upper"]),
+    Specificity = as.numeric(.x$specificity["estimate"]),
+    Specificity_lower = as.numeric(.x$specificity["lower"]),
+    Specificity_upper = as.numeric(.x$specificity["upper"]),
+    PPV = as.numeric(.x$ppv["estimate"]),
+    PPV_lower = as.numeric(.x$ppv["lower"]),
+    PPV_upper = as.numeric(.x$ppv["upper"]),
+    NPV = as.numeric(.x$npv["estimate"]),
+    NPV_lower = as.numeric(.x$npv["lower"]),
+    NPV_upper = as.numeric(.x$npv["upper"]),
+    F1 = as.numeric(.x$f1["estimate"]),
+    F1_lower = as.numeric(.x$f1["lower"]),
+    F1_upper = as.numeric(.x$f1["upper"]),
+    AUC = as.numeric(.x$auc["estimate"]),
+    AUC_lower = as.numeric(.x$auc["lower"]),
+    AUC_upper = as.numeric(.x$auc["upper"])
   )
-}, .id = "Model")
+}) %>%
+  dplyr::mutate(
+    Accuracy_CI95 = purrr::pmap_chr(list(Accuracy, Accuracy_lower, Accuracy_upper), ~ format_ci_text(..1, ..2, ..3)),
+    Sensitivity_CI95 = purrr::pmap_chr(list(Sensitivity, Sensitivity_lower, Sensitivity_upper), ~ format_ci_text(..1, ..2, ..3)),
+    Specificity_CI95 = purrr::pmap_chr(list(Specificity, Specificity_lower, Specificity_upper), ~ format_ci_text(..1, ..2, ..3)),
+    PPV_CI95 = purrr::pmap_chr(list(PPV, PPV_lower, PPV_upper), ~ format_ci_text(..1, ..2, ..3)),
+    NPV_CI95 = purrr::pmap_chr(list(NPV, NPV_lower, NPV_upper), ~ format_ci_text(..1, ..2, ..3)),
+    F1_CI95 = purrr::pmap_chr(list(F1, F1_lower, F1_upper), ~ format_ci_text(..1, ..2, ..3)),
+    AUC_CI95 = purrr::pmap_chr(list(AUC, AUC_lower, AUC_upper), ~ format_ci_text(..1, ..2, ..3))
+  )
 
 print("Test set performance summary:")
 print((performance_summary))
@@ -1810,86 +2018,52 @@ df.importance %>%
 ```{r genereate ROC plots, fig.width=5, fig.height=5}
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 1. For each model, compute a pROC::roc object on the test set, then extract
-#    (FPR, TPR) pairs. Combine into one data frame with a “model” column.
-# ────────────────────────────────────────────────────────────────────────────────
-
-roc_df <- imap_dfr(
-  test_predictions,
-  ~{
-    # .x is the list for a single model: list(probabilities, predictions, actual)
-    # .y is the model name (e.g. "Logistic", "Random Forest", etc.)
-    probs <- .x$probabilities$GBM
-    actuals <- .x$actual
-    
-    # Ensure 'actuals' is a factor whose positive class is "GBM".
-    # If 'actuals' is already a factor, pROC will detect "GBM" automatically.
-    # Otherwise, coerce to factor with levels = c(<non‐GBM>, "GBM").
-    if (!inherits(actuals, "factor")) {
-      actuals <- factor(actuals, levels = sort(unique(actuals)))
-    }
-    
-    # Compute ROC. By default pROC will assume the second level of 'actuals' is positive;
-    # if your factor is ordered differently, you can force: levels = c("NoGBM","GBM").
-    roc_obj <- roc(actuals, probs, quiet = TRUE)
-    
-    # Extract (1 – specificity) and sensitivity:
-    tibble(
-      fpr   = 1 - roc_obj$specificities,
-      tpr   =    roc_obj$sensitivities,
-      model = .y
-    )
-  }
+# Build ROC curve data with pointwise 95% CI bands for each model
+roc_ci_df <- imap_dfr(
+  test_metrics,
+  ~ build_roc_ci_df(.x$roc, .y, conf.level = 0.95, boot.n = 1000, grid_n = 101)
 )
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 2. (Optional) Compute each model’s AUC for annotation:
-# ────────────────────────────────────────────────────────────────────────────────
 
 auc_df <- imap_dfr(
-  test_predictions,
-  ~{
-    prol <- .x$probabilities$GBM
-    actl <- .x$actual
-    if (!inherits(actl, "factor")) {
-      actl <- factor(actl, levels = sort(unique(actl)))
-    }
-    auc_val <- as.numeric(auc(roc(actl, prol, quiet = TRUE)))
-    tibble(model = .y, AUC = round(auc_val, 3))
-  }
-)
+  test_metrics,
+  ~ tibble(
+    model = .y,
+    AUC = as.numeric(.x$auc["estimate"]),
+    AUC_lower = as.numeric(.x$auc["lower"]),
+    AUC_upper = as.numeric(.x$auc["upper"])
+  )
+) %>%
+  mutate(
+    AUC_CI95 = purrr::pmap_chr(list(AUC, AUC_lower, AUC_upper), ~ format_ci_text(..1, ..2, ..3)),
+    model_label = paste0(model, " (", AUC_CI95, ")")
+  )
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 3. Plot all ROC curves together using ggplot2
-# ────────────────────────────────────────────────────────────────────────────────
+label_map <- setNames(auc_df$model_label, auc_df$model)
 
-ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
-  # geom_line(size = 1) +
-  geom_smooth(span = 0.25, se = F) + 
-  # Add diagonal 45° line to denote “random‐guess” baseline
+print("Test-set AUROC estimates with 95% CIs:")
+print(auc_df %>% dplyr::select(model, AUC, AUC_lower, AUC_upper, AUC_CI95))
+
+ggplot(roc_ci_df, aes(x = fpr, y = tpr, color = model, fill = model)) +
+  geom_ribbon(aes(ymin = tpr_lower, ymax = tpr_upper), alpha = 0.12, linewidth = 0) +
+  geom_line(linewidth = 1) +
   geom_abline(
     slope = 1, intercept = 0,
     linetype = "dashed", color = "gray50"
   ) +
   labs(
-    x     = "False Positive Rate (1 − Specificity)",
-    y     = "True Positive Rate (Sensitivity)",
-    title = "ROC Curves on Test Set",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    title = "ROC Curves on Test Set with 95% CI Bands",
     color = "Model"
   ) +
-  # (Optional) annotate AUC values next to the legend
-  guides(color = guide_legend(
-    override.aes = list(label = paste0(
-      auc_df$model, " (AUC=", auc_df$AUC, ")"
-    ))
-  )) +
+  scale_color_discrete(labels = function(x) label_map[x]) +
   theme_miko() +
-  coord_cartesian(ylim = c(0,1), xlim = c(0,1)) + 
+  coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+  guides(fill = "none") +
   theme(
     legend.position = "bottom",
     legend.title = element_text(size = 11),
-    legend.text  = element_text(size = 9)
+    legend.text = element_text(size = 9)
   )
 
 ```
@@ -2004,6 +2178,16 @@ cm_multi <- caret::confusionMatrix(data = pred_multi_f, reference = ref_multi_f)
 print("Multi-class classification results:")
 print(cm_multi)
 
+multi_acc_ci <- c(
+  estimate = as.numeric(cm_multi$overall["Accuracy"]),
+  lower = as.numeric(cm_multi$overall["AccuracyLower"]),
+  upper = as.numeric(cm_multi$overall["AccuracyUpper"])
+)
+print(paste(
+  "Multi-class accuracy with 95% CI:",
+  format_ci_text(multi_acc_ci["estimate"], multi_acc_ci["lower"], multi_acc_ci["upper"])
+))
+
 # =============================================================================
 # 12. CLINICAL INTERPRETATION AND RELIABILITY ASSESSMENT
 # =============================================================================
@@ -2018,22 +2202,42 @@ threshold_analysis <- map_dfr(thresholds, ~{
   threshold <- .x
   pred_thresh <- factor(
     ifelse(test_predictions[[best_model_name]]$probabilities$GBM >= threshold, "GBM", "NonGBM"),
-    levels = c("Non-GBM", "GBM")
+    levels = c("NonGBM", "GBM")
   )
   
   cm_thresh <- caret::confusionMatrix(pred_thresh, test_data$is_GBM, positive = "GBM")
+  counts_thresh <- extract_binary_counts(cm_thresh$table, positive = "GBM")
   
-  data.frame(
+  sens_ci <- exact_binom_ci(counts_thresh["tp"], counts_thresh["tp"] + counts_thresh["fn"])
+  spec_ci <- exact_binom_ci(counts_thresh["tn"], counts_thresh["tn"] + counts_thresh["fp"])
+  ppv_ci <- exact_binom_ci(counts_thresh["tp"], counts_thresh["tp"] + counts_thresh["fp"])
+  npv_ci <- exact_binom_ci(counts_thresh["tn"], counts_thresh["tn"] + counts_thresh["fn"])
+  
+  tibble(
     threshold = threshold,
-    sensitivity = cm_thresh$byClass["Sensitivity"],
-    specificity = cm_thresh$byClass["Specificity"],
-    ppv = cm_thresh$byClass["Pos Pred Value"],
-    npv = cm_thresh$byClass["Neg Pred Value"]
-  )
+    sensitivity = as.numeric(sens_ci["estimate"]),
+    sensitivity_lower = as.numeric(sens_ci["lower"]),
+    sensitivity_upper = as.numeric(sens_ci["upper"]),
+    specificity = as.numeric(spec_ci["estimate"]),
+    specificity_lower = as.numeric(spec_ci["lower"]),
+    specificity_upper = as.numeric(spec_ci["upper"]),
+    ppv = as.numeric(ppv_ci["estimate"]),
+    ppv_lower = as.numeric(ppv_ci["lower"]),
+    ppv_upper = as.numeric(ppv_ci["upper"]),
+    npv = as.numeric(npv_ci["estimate"]),
+    npv_lower = as.numeric(npv_ci["lower"]),
+    npv_upper = as.numeric(npv_ci["upper"])
+  ) %>%
+    dplyr::mutate(
+      sensitivity_CI95 = format_ci_text(sensitivity, sensitivity_lower, sensitivity_upper),
+      specificity_CI95 = format_ci_text(specificity, specificity_lower, specificity_upper),
+      ppv_CI95 = format_ci_text(ppv, ppv_lower, ppv_upper),
+      npv_CI95 = format_ci_text(npv, npv_lower, npv_upper)
+    )
 })
 
 print("Threshold analysis for clinical decision-making:")
-print(round(threshold_analysis, 3))
+print(threshold_analysis)
 
 # =============================================================================
 # 13. COHORT GENERALIZABILITY ANALYSIS
@@ -2052,24 +2256,34 @@ if(length(unique(df_ml$cohort)) > 1) {
       actual_cohort <- cohort_data$is_GBM
       
       if(length(unique(actual_cohort)) == 2) {  # Only if both classes present
-        roc_cohort <- roc(actual_cohort, pred_cohort$GBM)
+        roc_cohort <- roc(actual_cohort, pred_cohort$GBM, quiet = TRUE)
         auc_cohort <- as.numeric(auc(roc_cohort))
+        auc_ci <- safe_ci_auc(roc_cohort, conf.level = 0.95)
       } else {
         auc_cohort <- NA
+        auc_ci <- c(lower = NA_real_, estimate = NA_real_, upper = NA_real_)
       }
       
-      data.frame(
+      tibble(
         cohort = .x,
         n_samples = nrow(cohort_data),
         n_gbm = sum(actual_cohort == "GBM"),
-        auc = auc_cohort
-      )
+        auc = auc_cohort,
+        auc_lower = as.numeric(auc_ci["lower"]),
+        auc_upper = as.numeric(auc_ci["upper"])
+      ) %>%
+        dplyr::mutate(
+          auc_CI95 = format_ci_text(auc, auc_lower, auc_upper)
+        )
     } else {
-      data.frame(
+      tibble(
         cohort = .x,
         n_samples = nrow(cohort_data),
         n_gbm = sum(cohort_data$is_GBM == "GBM"),
-        auc = NA
+        auc = NA_real_,
+        auc_lower = NA_real_,
+        auc_upper = NA_real_,
+        auc_CI95 = "NA"
       )
     }
   })
@@ -2093,8 +2307,8 @@ cat(sprintf("- GBM cases: %d (%.1f%%)\n",
     sum(df_complete$is_GBM == "GBM"), 
     100 * mean(df_complete$is_GBM == "GBM")))
 cat(sprintf("- Non-GBM cases: %d (%.1f%%)\n", 
-    sum(df_complete$is_GBM == "Non-GBM"), 
-    100 * mean(df_complete$is_GBM == "Non-GBM")))
+    sum(df_complete$is_GBM == "NonGBM"), 
+    100 * mean(df_complete$is_GBM == "NonGBM")))
 cat(sprintf("- Number of cohorts: %d\n", length(unique(df_complete$cohort))))
 cat(sprintf("- Biomarkers used: %d\n", length(BIOMARKER_LIST)))
 cat(sprintf("- Batch correction applied: %s\n\n", 
@@ -2103,12 +2317,48 @@ cat(sprintf("- Batch correction applied: %s\n\n",
 # Best model performance
 cat("Best Model Performance:\n")
 cat(sprintf("- Model: %s\n", best_model_name))
-cat(sprintf("- Test AUC: %.3f\n", best_metrics$auc))
-cat(sprintf("- Accuracy: %.3f\n", best_metrics$accuracy))
-cat(sprintf("- Sensitivity: %.3f\n", best_metrics$sensitivity))
-cat(sprintf("- Specificity: %.3f\n", best_metrics$specificity))
-cat(sprintf("- PPV: %.3f\n", best_metrics$ppv))
-cat(sprintf("- NPV: %.3f\n\n", best_metrics$npv))
+cat(sprintf(
+  "- Test AUC: %.3f (95%% CI %.3f-%.3f)\n",
+  as.numeric(best_metrics$auc["estimate"]),
+  as.numeric(best_metrics$auc["lower"]),
+  as.numeric(best_metrics$auc["upper"])
+))
+cat(sprintf(
+  "- Accuracy: %.3f (95%% CI %.3f-%.3f)\n",
+  as.numeric(best_metrics$accuracy["estimate"]),
+  as.numeric(best_metrics$accuracy["lower"]),
+  as.numeric(best_metrics$accuracy["upper"])
+))
+cat(sprintf(
+  "- Sensitivity: %.3f (95%% CI %.3f-%.3f)\n",
+  as.numeric(best_metrics$sensitivity["estimate"]),
+  as.numeric(best_metrics$sensitivity["lower"]),
+  as.numeric(best_metrics$sensitivity["upper"])
+))
+cat(sprintf(
+  "- Specificity: %.3f (95%% CI %.3f-%.3f)\n",
+  as.numeric(best_metrics$specificity["estimate"]),
+  as.numeric(best_metrics$specificity["lower"]),
+  as.numeric(best_metrics$specificity["upper"])
+))
+cat(sprintf(
+  "- PPV: %.3f (95%% CI %.3f-%.3f)\n",
+  as.numeric(best_metrics$ppv["estimate"]),
+  as.numeric(best_metrics$ppv["lower"]),
+  as.numeric(best_metrics$ppv["upper"])
+))
+cat(sprintf(
+  "- NPV: %.3f (95%% CI %.3f-%.3f)\n",
+  as.numeric(best_metrics$npv["estimate"]),
+  as.numeric(best_metrics$npv["lower"]),
+  as.numeric(best_metrics$npv["upper"])
+))
+cat(sprintf(
+  "- F1: %.3f (95%% CI %.3f-%.3f)\n\n",
+  as.numeric(best_metrics$f1["estimate"]),
+  as.numeric(best_metrics$f1["lower"]),
+  as.numeric(best_metrics$f1["upper"])
+))
 
 
 
