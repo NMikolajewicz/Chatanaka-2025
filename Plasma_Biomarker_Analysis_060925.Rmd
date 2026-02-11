@@ -1989,7 +1989,17 @@ model_multi_rf <- train(
 
 # Multi-class predictions
 pred_multi <- predict(model_multi_rf, test_data, type = "raw")
-cm_multi <- caret::confusionMatrix(pred_multi, test_data$diagnosis_multi2)
+
+# Pick one canonical set of classes (best: from training target)
+cls <- levels(train_data$diagnosis_multi2)
+cls <- sort(unique(c(as.character(pred_multi), as.character(test_data$diagnosis_multi2))))
+
+
+pred_multi_f <- factor(pred_multi, levels = cls)
+ref_multi_f  <- factor(test_data$diagnosis_multi2, levels = cls)
+
+cm_multi <- caret::confusionMatrix(data = pred_multi_f, reference = ref_multi_f)
+# cm_multi <- caret::confusionMatrix(pred_multi, test_data$diagnosis_multi2)
 
 print("Multi-class classification results:")
 print(cm_multi)
