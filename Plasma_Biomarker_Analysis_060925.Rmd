@@ -2082,9 +2082,9 @@ if(length(unique(df_ml$cohort)) > 1) {
 # 14. FINAL REPORT
 # =============================================================================
 
-cat("\n", "="*70, "\n")
+cat("\n", strrep("=", 70), "\n")
 cat("FINAL ASSESSMENT: GBM CLASSIFICATION USING BIOMARKERS\n")
-cat("="*70, "\n\n")
+cat(strrep("=", 70), "\n\n")
 
 # Dataset summary
 cat("Dataset Characteristics:\n")
